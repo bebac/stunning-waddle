@@ -19,6 +19,12 @@ namespace http
     v3
   };
 
+  enum class connection_role
+  {
+    client,
+    server
+  };
+
   class protocol_engine
   {
   public:
@@ -26,6 +32,7 @@ namespace http
     using stream_closed_callback = std::function<void(uint32_t)>;
     using stream_reset_callback = std::function<void(uint32_t, std::error_code)>;
     using headers_callback = std::function<void(uint32_t, const headers&)>;
+    using new_stream_callback = std::function<void(uint32_t)>;
 
   public:
     virtual ~protocol_engine() = default;
@@ -55,11 +62,20 @@ namespace http
     //
     virtual uint32_t open_stream() = 0;
 
-    virtual void send_headers(
+    // Client: send request headers
+    virtual void send_request_headers(
       uint32_t stream_id,
       std::string_view method,
       std::string_view path,
       std::string_view authority,
+      const headers& headers,
+      bool end_stream
+    ) = 0;
+
+    // Server: send response headers
+    virtual void send_response_headers(
+      uint32_t stream_id,
+      int status_code,
       const headers& headers,
       bool end_stream
     ) = 0;
@@ -88,11 +104,18 @@ namespace http
       reset_cb_ = std::move(cb);
     }
 
+    // Server mode: called when client opens a new stream
+    void on_new_stream(new_stream_callback cb)
+    {
+      new_stream_cb_ = std::move(cb);
+    }
+
   protected:
     headers_callback headers_cb_;
     data_callback data_cb_;
     stream_closed_callback closed_cb_;
     stream_reset_callback reset_cb_;
+    new_stream_callback new_stream_cb_;
   };
 } // namespace http
 

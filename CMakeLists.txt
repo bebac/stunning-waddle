@@ -3,8 +3,10 @@ project(stunning-waddle VERSION 0.1.0 LANGUAGES CXX)
 
 # Define the Library
 add_library(stunning-waddle STATIC
+    source/context_base.cpp
     source/client_context.cpp
-    source/client_stream.cpp
+    source/server_context.cpp
+    source/stream.cpp
     source/headers.cpp
     source/v2/engine.cpp
     source/v2/frame_parser.cpp

@@ -1,7 +1,7 @@
 #ifndef INCLUDE_HTTP_ADAPTERS_CORO_H
 #define INCLUDE_HTTP_ADAPTERS_CORO_H
 
-#include "http/client_stream.h"
+#include "http/stream.h"
 #include "http/headers.h"
 #include <charconv>
 #include <coroutine>
@@ -107,7 +107,7 @@ namespace http
   // --- HTTP Awaiter & Handle ---
 
   struct response_awaiter {
-    client_stream stream;
+    stream stream;
     std::string method, path, host, body;
     headers request_headers;
 
@@ -162,7 +162,7 @@ namespace http
   class request_handle
   {
   public:
-    explicit request_handle(client_stream stream) : stream_(std::move(stream))
+    explicit request_handle(stream s) : stream_(std::move(s))
     {
     }
 
@@ -199,7 +199,7 @@ namespace http
     }
 
   private:
-    client_stream stream_;
+    stream stream_;
     std::string method_ = "GET";
     std::string path_ = "/";
     std::string host_;

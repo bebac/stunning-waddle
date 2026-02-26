@@ -7,8 +7,17 @@ namespace http::v2
     constexpr std::string_view preface{"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"};
   }
 
-  engine::engine()
+  engine::engine(connection_role role)
+    : role_(role)
   {
+    // Server uses even stream IDs (for push), client uses odd
+    next_stream_id_ = (role == connection_role::server) ? 2 : 1;
+
+    // Server starts waiting for client preface
+    if (role == connection_role::server) {
+      state_ = state::awaiting_preface;
+    }
+
     parser_.on_frame_header(
       [this](frame_header h) {
         this->handle_frame_header(h);
@@ -24,14 +33,36 @@ namespace http::v2
 
   std::span<std::byte> engine::input_begin()
   {
-    return std::span(reinterpret_cast<std::byte*>(input_buffer_.data()), input_buffer_.size());
+    if (state_ == state::awaiting_preface) {
+      // Server mode: buffer for preface validation
+      return std::span(input_buffer_.data() + input_buffered_,
+                       input_buffer_.size() - input_buffered_);
+    }
+    return std::span(input_buffer_.data(), input_buffer_.size());
   }
 
   void engine::input_end(size_t n)
   {
-    if (n > 0) {
-      parser_.consume(std::span<const std::byte>(input_buffer_.data(), n));
+    if (n == 0) return;
+
+    if (state_ == state::awaiting_preface) {
+      input_buffered_ += n;
+      if (input_buffered_ >= preface.size() && try_consume_client_preface()) {
+        // Preface validated, send our SETTINGS
+        write_settings();
+        state_ = state::ready;
+        // Process any remaining data after preface (offset past preface)
+        size_t remaining = input_buffered_ - preface.size();
+        if (remaining > 0) {
+          parser_.consume(std::span<const std::byte>(
+            input_buffer_.data() + preface.size(), remaining));
+        }
+        input_buffered_ = 0;
+      }
+      return;
     }
+
+    parser_.consume(std::span<const std::byte>(input_buffer_.data(), n));
   }
 
   std::span<const std::byte> engine::output_begin()
@@ -49,18 +80,19 @@ namespace http::v2
   {
     auto id = next_stream_id_;
 
-    if ( state_ == state::idle )
+    if (role_ == connection_role::client && state_ == state::idle)
     {
       write_preface();
       write_settings();
       state_ = state::preface_sent;
     }
 
+    known_streams_.insert(id);
     next_stream_id_ += 2;
     return id;
   }
 
-  void engine::send_headers(
+  void engine::send_request_headers(
     uint32_t stream_id,
     std::string_view method,
     std::string_view path,
@@ -80,10 +112,36 @@ namespace http::v2
       header_list.push_back(h);
     }
 
+    send_headers_frame(stream_id, header_list, end_stream);
+  }
+
+  void engine::send_response_headers(
+    uint32_t stream_id,
+    int status_code,
+    const headers& headers,
+    bool end_stream
+  )
+  {
+    std::vector<http::header> header_list = {
+      {":status", std::to_string(status_code)}};
+
+    for (const auto& h : headers.get())
+    {
+      header_list.push_back(h);
+    }
+
+    send_headers_frame(stream_id, header_list, end_stream);
+  }
+
+  void engine::send_headers_frame(
+    uint32_t stream_id,
+    const std::vector<http::header>& header_list,
+    bool end_stream
+  )
+  {
     hpack_buffer header_block;
     encode_ctx_.encode(header_block, header_list);
 
-    // END_STREAM is true only if there is no payload
     // TODO: Handle splitting header block into CONTINUATION frames if needed
     encode_headers_frame(pending_out_, stream_id, header_block, true, end_stream);
   }
@@ -145,6 +203,14 @@ namespace http::v2
         }
         break;
       case frame_type::headers:
+        // Server mode: check if this is a new stream from client
+        if (role_ == connection_role::server && known_streams_.find(h.stream_id) == known_streams_.end())
+        {
+          known_streams_.insert(h.stream_id);
+          if (new_stream_cb_) {
+            new_stream_cb_(h.stream_id);
+          }
+        }
         if ((h.flags & std::byte(0x04)) != std::byte{0}) // END_HEADERS
         {
           auto decoded = decode_ctx_.decode(data, len);
@@ -193,7 +259,18 @@ namespace http::v2
 
   void engine::write_settings()
   {
-    // 2. Queue initial empty SETTINGS frame
+    // Queue initial empty SETTINGS frame
     encode_settings_frame(pending_out_, {}, false);
+  }
+
+  bool engine::try_consume_client_preface()
+  {
+    // Validate preface (caller already checked we have enough bytes)
+    if (std::memcmp(input_buffer_.data(), preface.data(), preface.size()) != 0) {
+      // Invalid preface - this is a connection error
+      // TODO: Send GOAWAY and close connection
+      return false;
+    }
+    return true;
   }
 }

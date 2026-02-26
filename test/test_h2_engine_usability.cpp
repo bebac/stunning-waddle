@@ -18,7 +18,7 @@ TEST_CASE("HTTP/2 Engine Usability")
     uint32_t stream_id = engine.open_stream();
     CHECK(stream_id == 1);
 
-    engine.send_headers(stream_id, "GET", "/", "localhost", headers, true);
+    engine.send_request_headers(stream_id, "GET", "/", "localhost", headers, true);
 
     // Clear preface and settings from buffer
     engine.output_end(24 + 9);

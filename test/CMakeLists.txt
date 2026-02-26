@@ -19,6 +19,8 @@ add_executable(unit_tests
     test_h2_request_payload.cpp
     test_headers.cpp
     test_http_client_context.cpp
+    test_server_context.cpp
+    test_server_engine.cpp
     test_main.cpp
 )
 

@@ -16,7 +16,7 @@ TEST_CASE("HTTP/2 Engine Request Payload")
     auto payload = std::as_bytes(std::span(payload_str));
 
     http::headers h;
-    engine.send_headers(1, "POST", "/test", "localhost", h, false);
+    engine.send_request_headers(1, "POST", "/test", "localhost", h, false);
     engine.send_data(1, payload, true);
 
     auto out = engine.output_begin();
@@ -66,7 +66,7 @@ TEST_CASE("HTTP/2 Engine Request Payload")
     std::vector<std::byte> large_payload(20000, std::byte('A'));
 
     http::headers h;
-    engine.send_headers(1, "POST", "/large", "localhost", h, false);
+    engine.send_request_headers(1, "POST", "/large", "localhost", h, false);
     engine.send_data(1, large_payload, true);
 
     auto out = engine.output_begin();

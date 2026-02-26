@@ -107,7 +107,7 @@ namespace http
   // --- HTTP Awaiter & Handle ---
 
   struct response_awaiter {
-    stream stream;
+    http::stream stream;
     std::string method, path, host, body;
     headers request_headers;
 

@@ -5,12 +5,37 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      run_on_os:
+        description: 'Select OS to run'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - ubuntu-24.04
+          - macos-15
 
 jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.run_on_os }}" != "both" ]]; then
+            echo "matrix={\"os\":[\"${{ github.event.inputs.run_on_os }}\"]}" >> $GITHUB_OUTPUT
+          else
+            echo "matrix={\"os\":[\"ubuntu-24.04\",\"macos-15\"]}" >> $GITHUB_OUTPUT
+          fi
+
   build_and_test:
+    needs: setup
     strategy:
-      matrix:
-        os: [ubuntu-24.04, macos-15]
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
 
     runs-on: ${{ matrix.os }}
 

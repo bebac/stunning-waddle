@@ -11,6 +11,7 @@ FetchContent_MakeAvailable(doctest)
 add_executable(unit_tests
     test_h2_engine_usability.cpp
     test_h2_engine.cpp
+    test_h2_flow_control.cpp
     test_h2_frame_parser.cpp
     test_h2_frame.cpp
     test_h2_hpack_compliance.cpp

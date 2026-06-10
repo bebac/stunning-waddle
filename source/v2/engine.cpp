@@ -195,8 +195,10 @@ namespace http::v2
         if (data_cb_) {
           data_cb_(h.stream_id, data, len);
         }
+        update_flow_control(h.stream_id, static_cast<uint32_t>(len));
         if ((h.flags & std::byte{0x01}) != std::byte{0})
         {
+          stream_consumed_.erase(h.stream_id);
           if (closed_cb_) {
             closed_cb_(h.stream_id);
           }
@@ -241,6 +243,7 @@ namespace http::v2
       case frame_type::goaway:
         break;
       case frame_type::window_update:
+        // TODO: Track peer's window updates for send-side flow control.
         break;
       case frame_type::continuation:
         break;
@@ -261,6 +264,27 @@ namespace http::v2
   {
     // Queue initial empty SETTINGS frame
     encode_settings_frame(pending_out_, {}, false);
+  }
+
+  void engine::update_flow_control(uint32_t stream_id, uint32_t bytes_received)
+  {
+    // Accumulate consumed bytes for both connection and stream.
+    connection_consumed_ += bytes_received;
+    stream_consumed_[stream_id] += bytes_received;
+
+    // Send connection-level WINDOW_UPDATE when half the window is consumed.
+    uint32_t threshold = initial_window_size_ / 2;
+
+    if (connection_consumed_ >= threshold) {
+      encode_window_update_frame(pending_out_, 0, connection_consumed_);
+      connection_consumed_ = 0;
+    }
+
+    // Send stream-level WINDOW_UPDATE.
+    if (stream_consumed_[stream_id] >= threshold) {
+      encode_window_update_frame(pending_out_, stream_id, stream_consumed_[stream_id]);
+      stream_consumed_[stream_id] = 0;
+    }
   }
 
   bool engine::try_consume_client_preface()

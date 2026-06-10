@@ -101,4 +101,28 @@ namespace http::v2
       dst.push_back(std::byte(s.value & 0xFF));
     }
   }
+
+  void encode_window_update_frame(
+    std::vector<std::byte>& dst,
+    uint32_t stream_id,
+    uint32_t increment
+  )
+  {
+    frame_header hdr{
+      .length = 4,
+      .type = frame_type::window_update,
+      .flags = std::byte{0x00},
+      .stream_id = stream_id,
+      .reserved = 0
+    };
+
+    write_frame_header(dst, hdr);
+
+    // Payload: 31-bit window size increment (MSB reserved, must be 0).
+    uint32_t val = increment & 0x7FFFFFFF;
+    dst.push_back(static_cast<std::byte>((val >> 24) & 0xFF));
+    dst.push_back(static_cast<std::byte>((val >> 16) & 0xFF));
+    dst.push_back(static_cast<std::byte>((val >> 8) & 0xFF));
+    dst.push_back(static_cast<std::byte>(val & 0xFF));
+  }
 }

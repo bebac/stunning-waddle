@@ -62,6 +62,12 @@ namespace http::v2
     const std::vector<setting>& settings,
     bool ack
   );
+
+  void encode_window_update_frame(
+    std::vector<std::byte>& dst,
+    uint32_t stream_id,
+    uint32_t increment
+  );
 } // namespace http::v2
 
 #endif // INCLUDE_HTTP_V2_FRAME_H

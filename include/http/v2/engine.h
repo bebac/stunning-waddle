@@ -10,6 +10,7 @@
 #include <array>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <set>
 #include <span>
 #include <string>
@@ -70,6 +71,9 @@ namespace http::v2
     void send_headers_frame(uint32_t stream_id, const std::vector<http::header>& header_list, bool end_stream);
 
   private:
+    void update_flow_control(uint32_t stream_id, uint32_t bytes_received);
+
+  private:
     connection_role role_;
     state state_ = state::idle;
     std::array<std::byte, 16384> input_buffer_;
@@ -80,6 +84,12 @@ namespace http::v2
     hpack_context decode_ctx_;
     uint32_t next_stream_id_ = 1;
     std::set<uint32_t> known_streams_;  // Track streams we know about
+
+    // Flow control: track consumed bytes and emit WINDOW_UPDATEs.
+    static constexpr uint32_t default_initial_window_size_ = 65535;
+    uint32_t initial_window_size_ = default_initial_window_size_;
+    uint32_t connection_consumed_ = 0;
+    std::map<uint32_t, uint32_t> stream_consumed_;
   };
 } // namespace http::v2
 

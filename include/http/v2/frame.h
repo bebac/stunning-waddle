@@ -1,6 +1,7 @@
 #ifndef INCLUDE_HTTP_V2_FRAME_H
 #define INCLUDE_HTTP_V2_FRAME_H
 
+#include "http/error_codes.h"
 #include <cstdint>
 #include <vector>
 #include <map>
@@ -78,7 +79,7 @@ namespace http::v2
   void encode_goaway_frame(
     std::vector<std::byte>& dst,
     uint32_t last_stream_id,
-    uint32_t error_code,
+    http::error_code error_code,
     std::span<const std::byte> debug_data = {}
   );
 } // namespace http::v2

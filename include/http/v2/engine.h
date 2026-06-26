@@ -3,6 +3,7 @@
 
 #include "http/protocol_engine.h"
 #include "http/headers.h"
+#include "http/error_codes.h"
 #include "http/v2/frame.h"
 #include "http/v2/frame_parser.h"
 #include "http/v2/hpack_context.h"
@@ -60,7 +61,7 @@ namespace http::v2
     {
     }
 
-    void send_goaway(uint32_t last_stream_id, uint32_t error_code, std::span<const std::byte> debug_data = {});
+    void send_goaway(uint32_t last_stream_id, http::error_code error_code, std::span<const std::byte> debug_data = {});
 
   public:
     // --- Outgoing (send-side) flow-control inspection ---
@@ -120,9 +121,10 @@ namespace http::v2
     // which the parser may deliver across multiple chunks.
     std::vector<std::byte> control_payload_;
 
-    std::function<void(uint32_t, uint32_t)> goaway_cb_;
+    std::function<void(uint32_t, http::error_code)> goaway_cb_;
     bool goaway_received_ = false;
     uint32_t last_goaway_stream_id_ = 0;
+    http::error_code last_goaway_error_code_ = http::error_code::no_error;
   };
 } // namespace http::v2
 

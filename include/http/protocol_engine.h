@@ -2,6 +2,7 @@
 #define INCLUDE_HTTP_PROTOCOL_ENGINE_H
 
 #include "http/headers.h"
+#include "http/error_codes.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -33,7 +34,7 @@ namespace http
     using stream_reset_callback = std::function<void(uint32_t, std::error_code)>;
     using headers_callback = std::function<void(uint32_t, const headers&)>;
     using new_stream_callback = std::function<void(uint32_t)>;
-    using goaway_callback = std::function<void(uint32_t last_stream_id, uint32_t error_code)>;
+    using goaway_callback = std::function<void(uint32_t last_stream_id, http::error_code error_code)>;
 
   public:
     virtual ~protocol_engine() = default;

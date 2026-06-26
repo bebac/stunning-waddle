@@ -1,4 +1,5 @@
 #include "http/context_base.h"
+#include "http/error_codes.h"
 
 namespace http
 {
@@ -30,9 +31,9 @@ namespace http
       dispatch_reset(id, ec);
     });
 
-    engine_->on_goaway([this](uint32_t last_stream_id, uint32_t error_code) {
+    engine_->on_goaway([this](uint32_t last_stream_id, http::error_code error_code) {
       if (on_goaway_) {
-        on_goaway_(last_stream_id, std::error_code(error_code, std::generic_category()));
+        on_goaway_(last_stream_id, http::make_error_code(error_code));
       }
     });
   }

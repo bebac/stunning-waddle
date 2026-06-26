@@ -1,4 +1,5 @@
 #include "http/v2/frame.h"
+#include "http/error_codes.h"
 
 namespace http::v2
 {
@@ -129,7 +130,7 @@ namespace http::v2
   void encode_goaway_frame(
     std::vector<std::byte>& dst,
     uint32_t last_stream_id,
-    uint32_t error_code,
+    http::error_code error_code,
     std::span<const std::byte> debug_data
   )
   {
@@ -153,11 +154,12 @@ namespace http::v2
     dst.push_back(static_cast<std::byte>((stream_id_val >> 8) & 0xFF));
     dst.push_back(static_cast<std::byte>(stream_id_val & 0xFF));
 
-    // Error Code (32-bit)
-    dst.push_back(static_cast<std::byte>((error_code >> 24) & 0xFF));
-    dst.push_back(static_cast<std::byte>((error_code >> 16) & 0xFF));
-    dst.push_back(static_cast<std::byte>((error_code >> 8) & 0xFF));
-    dst.push_back(static_cast<std::byte>(error_code & 0xFF));
+    // Error Code (32-bit) - convert unified error_code to wire format
+    uint32_t wire_error_code = static_cast<uint32_t>(error_code);
+    dst.push_back(static_cast<std::byte>((wire_error_code >> 24) & 0xFF));
+    dst.push_back(static_cast<std::byte>((wire_error_code >> 16) & 0xFF));
+    dst.push_back(static_cast<std::byte>((wire_error_code >> 8) & 0xFF));
+    dst.push_back(static_cast<std::byte>(wire_error_code & 0xFF));
 
     // Debug data (optional)
     if (!debug_data.empty()) {

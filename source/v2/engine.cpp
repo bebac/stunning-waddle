@@ -1,4 +1,5 @@
 #include "http/v2/engine.h"
+#include "http/error_codes.h"
 #include <iostream>
 
 namespace http::v2
@@ -431,12 +432,15 @@ namespace http::v2
       return;
     }
 
-    // Extract error_code (32-bit)
-    uint32_t error_code =
+    // Extract error_code (32-bit) from wire format
+    uint32_t wire_error_code =
       (std::to_integer<uint32_t>(payload[4]) << 24) |
       (std::to_integer<uint32_t>(payload[5]) << 16) |
       (std::to_integer<uint32_t>(payload[6]) << 8) |
       std::to_integer<uint32_t>(payload[7]);
+
+    // Convert to unified error_code
+    http::error_code error_code = static_cast<http::error_code>(wire_error_code);
 
     // Extract debug data (if any)
     std::vector<std::byte> debug_data;
@@ -447,6 +451,7 @@ namespace http::v2
     // Update state
     goaway_received_ = true;
     last_goaway_stream_id_ = last_stream_id;
+    last_goaway_error_code_ = error_code;
 
     // Invoke callback
     if (goaway_cb_) {
@@ -454,7 +459,7 @@ namespace http::v2
     }
   }
 
-  void engine::send_goaway(uint32_t last_stream_id, uint32_t error_code, std::span<const std::byte> debug_data)
+  void engine::send_goaway(uint32_t last_stream_id, http::error_code error_code, std::span<const std::byte> debug_data)
   {
     encode_goaway_frame(pending_out_, last_stream_id, error_code, debug_data);
   }

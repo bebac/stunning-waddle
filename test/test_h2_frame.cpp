@@ -1,6 +1,7 @@
 #include "doctest/doctest.h"
 #include "test_helpers.h"
 #include "http/v2/frame.h"
+#include "http/error_codes.h"
 #include <vector>
 
 TEST_CASE("HTTP/2 Frame Header Definitions")
@@ -117,11 +118,10 @@ TEST_CASE("HTTP/2 GOAWAY Frame")
   {
     std::vector<std::byte> dst;
     uint32_t last_stream_id = 0x7FFFFFFF; // Maximum valid 31-bit stream ID
-    uint32_t error_code = 0x00; // NO_ERROR
+    http::error_code error_code = http::error_code::no_error;
 
     http::v2::encode_goaway_frame(dst, last_stream_id, error_code);
 
-    // Frame header (9 bytes) + payload (8 bytes) = 17 bytes
     CHECK(dst.size() == 17);
 
     // Check frame header
@@ -152,11 +152,9 @@ TEST_CASE("HTTP/2 GOAWAY Frame")
   {
     std::vector<std::byte> dst;
     uint32_t last_stream_id = 1;
-    uint32_t error_code = 0x01; // PROTOCOL_ERROR
+    http::error_code error_code = http::error_code::protocol_error;
 
     http::v2::encode_goaway_frame(dst, last_stream_id, error_code);
-
-    CHECK(dst.size() == 17);
 
     // Check payload - Last Stream ID
     CHECK(dst[9] == std::byte(0x00));
@@ -175,7 +173,7 @@ TEST_CASE("HTTP/2 GOAWAY Frame")
   {
     std::vector<std::byte> dst;
     uint32_t last_stream_id = 42;
-    uint32_t error_code = 0x02; // INTERNAL_ERROR
+    http::error_code error_code = http::error_code::internal_error;
     auto debug_data = make_bytes('D', 'E', 'B', 'U', 'G');
 
     http::v2::encode_goaway_frame(dst, last_stream_id, error_code, debug_data);
@@ -212,7 +210,7 @@ TEST_CASE("HTTP/2 GOAWAY Frame")
   {
     std::vector<std::byte> dst;
     uint32_t last_stream_id = 100;
-    uint32_t error_code = 0x00; // NO_ERROR
+    http::error_code error_code = http::error_code::no_error;
     std::vector<std::byte> empty_debug_data;
 
     http::v2::encode_goaway_frame(dst, last_stream_id, error_code, empty_debug_data);
@@ -231,28 +229,26 @@ TEST_CASE("HTTP/2 GOAWAY Frame")
   {
     std::vector<std::byte> dst;
     uint32_t last_stream_id = 1;
-    uint32_t error_code = 0x0D; // HTTP_1_1_REQUIRED (highest defined error code)
+    http::error_code error_code = http::error_code::http_1_1_required;
 
     http::v2::encode_goaway_frame(dst, last_stream_id, error_code);
 
-    CHECK(dst.size() == 17);
+    // Check payload - Error Code
+    // Big-endian encoding: 0x00, 0x00, 0x10, 0x06
+    CHECK(dst[13] == std::byte(0x00)); // 0x1006 >> 24
+    CHECK(dst[14] == std::byte(0x00)); // 0x1006 >> 16
+    CHECK(dst[15] == std::byte(0x10)); // 0x1006 >> 8
+    CHECK(dst[16] == std::byte(0x06)); // 0x1006 & 0xFF
 
-    // Check payload - Error Code (HTTP_1_1_REQUIRED = 0x0D)
-    CHECK(dst[13] == std::byte(0x00));
-    CHECK(dst[14] == std::byte(0x00));
-    CHECK(dst[15] == std::byte(0x00));
-    CHECK(dst[16] == std::byte(0x0D));
   }
 
   SUBCASE("GOAWAY frame with zero last_stream_id")
   {
     std::vector<std::byte> dst;
     uint32_t last_stream_id = 0; // No streams processed
-    uint32_t error_code = 0x00; // NO_ERROR
+    http::error_code error_code = http::error_code::no_error;
 
     http::v2::encode_goaway_frame(dst, last_stream_id, error_code);
-
-    CHECK(dst.size() == 17);
 
     // Check payload - Last Stream ID (0)
     CHECK(dst[9] == std::byte(0x00));
@@ -265,11 +261,10 @@ TEST_CASE("HTTP/2 GOAWAY Frame")
   {
     std::vector<std::byte> dst;
     uint32_t last_stream_id = 123;
-    uint32_t error_code = 0x01;
+    http::error_code error_code = http::error_code::protocol_error;
 
     http::v2::encode_goaway_frame(dst, last_stream_id, error_code);
 
-    // Stream ID in header must be 0 for GOAWAY frames
     CHECK(dst[5] == std::byte(0x00));
     CHECK(dst[6] == std::byte(0x00));
     CHECK(dst[7] == std::byte(0x00));

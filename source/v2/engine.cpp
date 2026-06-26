@@ -1,4 +1,5 @@
 #include "http/v2/engine.h"
+#include <iostream>
 
 namespace http::v2
 {
@@ -67,6 +68,10 @@ namespace http::v2
 
   std::span<const std::byte> engine::output_begin()
   {
+    if ( pending_out_.size() > connection_send_window())
+    {
+      // TODO - What should we do if we have more outgoing data than connection send window allows?
+    }
     return std::span(reinterpret_cast<const std::byte*>(pending_out_.data()), pending_out_.size());
   }
 
@@ -88,6 +93,7 @@ namespace http::v2
     }
 
     known_streams_.insert(id);
+    stream_send_window_[id] = static_cast<int64_t>(peer_initial_window_size_);
     next_stream_id_ += 2;
     return id;
   }
@@ -163,6 +169,17 @@ namespace http::v2
       encode_data_frame(pending_out_, stream_id, data.subspan(offset - chunk_size, chunk_size), final_flag);
     }
     while (offset < data.size());
+
+    // Track outgoing flow-control consumption. NOTE: we intentionally do not
+    // gate/queue here yet — send_data still emits the whole body. Honoring the
+    // window before sending needs async coordination with the I/O pump and is a
+    // follow-up. Keeping the counters accurate is the prerequisite for that.
+    if (!data.empty())
+    {
+      auto consumed = static_cast<int64_t>(data.size());
+      connection_send_window_ -= consumed;
+      get_or_init_stream_send_window(stream_id) -= consumed;
+    }
   }
 
   void engine::handle_frame_header(frame_header h)
@@ -199,6 +216,7 @@ namespace http::v2
         if ((h.flags & std::byte{0x01}) != std::byte{0})
         {
           stream_consumed_.erase(h.stream_id);
+          stream_send_window_.erase(h.stream_id);
           if (closed_cb_) {
             closed_cb_(h.stream_id);
           }
@@ -228,6 +246,7 @@ namespace http::v2
         }
         break;
       case frame_type::priority:
+        //std::cerr << "[http] frame_type::priority unhandled" << std::endl;
         break;
       case frame_type::rst_stream:
         if (reset_cb_) {
@@ -235,17 +254,40 @@ namespace http::v2
         }
         break;
       case frame_type::settings:
+        // Reassemble the payload (it may arrive in chunks), then apply the
+        // settings we track, e.g. SETTINGS_INITIAL_WINDOW_SIZE for send windows.
+        control_payload_.insert(
+          control_payload_.end(),
+          reinterpret_cast<const std::byte*>(data),
+          reinterpret_cast<const std::byte*>(data) + len);
+        if (control_payload_.size() >= h.length) {
+          handle_settings_payload(control_payload_);
+          control_payload_.clear();
+        }
         break;
       case frame_type::push_promise:
+        //std::cerr << "[http] frame_type::push_promise unhandled" << std::endl;
         break;
       case frame_type::ping:
+        //std::cerr << "[http] frame_type::ping unhandled" << std::endl;
         break;
       case frame_type::goaway:
+        //std::cerr << "[http] frame_type::goaway unhandled" << std::endl;
         break;
       case frame_type::window_update:
-        // TODO: Track peer's window updates for send-side flow control.
+        // Reassemble the 4-byte payload (it may be split across reads) and add
+        // the increment to the matching outgoing window (stream 0 = connection).
+        control_payload_.insert(
+          control_payload_.end(),
+          reinterpret_cast<const std::byte*>(data),
+          reinterpret_cast<const std::byte*>(data) + len);
+        if (control_payload_.size() >= h.length) {
+          handle_window_update(h.stream_id, control_payload_);
+          control_payload_.clear();
+        }
         break;
       case frame_type::continuation:
+        //std::cerr << "[http] fframe_type::continuation unhandled" << std::endl;
         break;
     }
   }
@@ -285,6 +327,87 @@ namespace http::v2
       encode_window_update_frame(pending_out_, stream_id, stream_consumed_[stream_id]);
       stream_consumed_[stream_id] = 0;
     }
+  }
+
+  int64_t& engine::get_or_init_stream_send_window(uint32_t stream_id)
+  {
+    auto it = stream_send_window_.find(stream_id);
+    if (it == stream_send_window_.end()) {
+      it = stream_send_window_.emplace(
+        stream_id, static_cast<int64_t>(peer_initial_window_size_)).first;
+    }
+    return it->second;
+  }
+
+  int64_t engine::stream_send_window(uint32_t stream_id) const
+  {
+    auto it = stream_send_window_.find(stream_id);
+    if (it == stream_send_window_.end()) {
+      return static_cast<int64_t>(peer_initial_window_size_);
+    }
+    return it->second;
+  }
+
+  void engine::handle_window_update(uint32_t stream_id, std::span<const std::byte> payload)
+  {
+    if (payload.size() < 4) {
+      // Malformed WINDOW_UPDATE (should be FRAME_SIZE_ERROR); ignore for now.
+      return;
+    }
+
+    // 31-bit increment; the most-significant bit is reserved.
+    uint32_t increment =
+      (std::to_integer<uint32_t>(payload[0] & std::byte(0x7F)) << 24) |
+      (std::to_integer<uint32_t>(payload[1]) << 16) |
+      (std::to_integer<uint32_t>(payload[2]) <<  8) |
+       std::to_integer<uint32_t>(payload[3]);
+
+    if (increment == 0) {
+      // A zero increment is a PROTOCOL_ERROR per RFC 7540 6.9.
+      // TODO: surface as a connection/stream error once GOAWAY/RST exists.
+      return;
+    }
+
+    if (stream_id == 0) {
+      connection_send_window_ += static_cast<int64_t>(increment);
+    }
+    else {
+      get_or_init_stream_send_window(stream_id) += static_cast<int64_t>(increment);
+    }
+  }
+
+  void engine::handle_settings_payload(std::span<const std::byte> payload)
+  {
+    // SETTINGS payload is a sequence of 6-byte entries: u16 identifier, u32 value.
+    for (size_t i = 0; i + 6 <= payload.size(); i += 6) {
+      uint16_t id =
+        static_cast<uint16_t>(std::to_integer<uint16_t>(payload[i]) << 8) |
+         std::to_integer<uint16_t>(payload[i + 1]);
+      uint32_t value =
+        (std::to_integer<uint32_t>(payload[i + 2]) << 24) |
+        (std::to_integer<uint32_t>(payload[i + 3]) << 16) |
+        (std::to_integer<uint32_t>(payload[i + 4]) <<  8) |
+         std::to_integer<uint32_t>(payload[i + 5]);
+
+      if (static_cast<settings_id>(id) == settings_id::initial_window_size) {
+        apply_peer_initial_window_size(value);
+      }
+    }
+  }
+
+  void engine::apply_peer_initial_window_size(uint32_t new_size)
+  {
+    // RFC 7540 6.9.2: a change to SETTINGS_INITIAL_WINDOW_SIZE retroactively
+    // adjusts the send window of every existing stream by the delta. The
+    // connection-level window is unaffected.
+    int64_t delta = static_cast<int64_t>(new_size) -
+                    static_cast<int64_t>(peer_initial_window_size_);
+
+    for (auto& entry : stream_send_window_) {
+      entry.second += delta;
+    }
+
+    peer_initial_window_size_ = new_size;
   }
 
   bool engine::try_consume_client_preface()

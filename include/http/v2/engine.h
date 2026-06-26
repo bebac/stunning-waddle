@@ -60,10 +60,24 @@ namespace http::v2
     {
     }
 
+  public:
+    // --- Outgoing (send-side) flow-control inspection ---
+    //
+    // How much DATA the peer currently allows us to send. The connection-level
+    // window (stream 0) is shared by all streams; each stream also has its own
+    // window. These are tracked from received WINDOW_UPDATE/SETTINGS frames but
+    // are not yet enforced by send_data.
+    int64_t connection_send_window() const { return connection_send_window_; }
+    int64_t stream_send_window(uint32_t stream_id) const;
+
   private:
     void handle_frame_header(frame_header h);
     void handle_payload_chunk(frame_header h, const uint8_t* data, size_t len);
     bool try_consume_client_preface();
+    void handle_window_update(uint32_t stream_id, std::span<const std::byte> payload);
+    void handle_settings_payload(std::span<const std::byte> payload);
+    void apply_peer_initial_window_size(uint32_t new_size);
+    int64_t& get_or_init_stream_send_window(uint32_t stream_id);
 
   private:
     void write_preface();
@@ -90,6 +104,18 @@ namespace http::v2
     uint32_t initial_window_size_ = default_initial_window_size_;
     uint32_t connection_consumed_ = 0;
     std::map<uint32_t, uint32_t> stream_consumed_;
+
+    // Send-side flow control: the peer's advertised windows that bound how much
+    // DATA we may send. The connection-level window is shared across all
+    // streams. Signed so a SETTINGS-driven reduction of the initial window can
+    // make a stream window legitimately negative (RFC 7540 6.9.2).
+    int64_t connection_send_window_ = default_initial_window_size_;
+    uint32_t peer_initial_window_size_ = default_initial_window_size_;
+    std::map<uint32_t, int64_t> stream_send_window_;
+
+    // Reassembly buffer for control-frame payloads (WINDOW_UPDATE / SETTINGS),
+    // which the parser may deliver across multiple chunks.
+    std::vector<std::byte> control_payload_;
   };
 } // namespace http::v2
 

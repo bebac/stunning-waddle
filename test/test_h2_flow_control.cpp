@@ -241,3 +241,109 @@ TEST_CASE("Engine flow control: large streaming response")
   // Multiple WINDOW_UPDATEs should have been generated.
   CHECK(window_updates_sent >= 4);  // 200KB / ~32KB threshold ≈ 6 updates per level.
 }
+
+TEST_CASE("Engine flow control: outgoing (send-side) window tracking")
+{
+  using http::v2::engine;
+
+  SUBCASE("Windows initialize to the default 65535")
+  {
+    engine eng;
+    auto sid = eng.open_stream();
+    CHECK(eng.connection_send_window() == 65535);
+    CHECK(eng.stream_send_window(sid) == 65535);
+  }
+
+  SUBCASE("Connection-level WINDOW_UPDATE credits the connection window")
+  {
+    engine eng;
+    eng.open_stream();
+
+    std::vector<std::byte> wu;
+    http::v2::encode_window_update_frame(wu, 0, 10000);
+    mock::recv(eng, wu);
+
+    CHECK(eng.connection_send_window() == 65535 + 10000);
+  }
+
+  SUBCASE("Stream-level WINDOW_UPDATE credits only that stream")
+  {
+    engine eng;
+    auto sid = eng.open_stream();
+
+    std::vector<std::byte> wu;
+    http::v2::encode_window_update_frame(wu, sid, 5000);
+    mock::recv(eng, wu);
+
+    CHECK(eng.stream_send_window(sid) == 65535 + 5000);
+    CHECK(eng.connection_send_window() == 65535);  // unchanged
+  }
+
+  SUBCASE("send_data consumes both connection and stream windows")
+  {
+    engine eng;
+    auto sid = eng.open_stream();
+
+    std::vector<std::byte> body(1000, std::byte{'x'});
+    eng.send_data(sid, body, /*end_stream=*/false);
+
+    CHECK(eng.connection_send_window() == 65535 - 1000);
+    CHECK(eng.stream_send_window(sid) == 65535 - 1000);
+  }
+
+  SUBCASE("WINDOW_UPDATE replenishes what send_data consumed")
+  {
+    engine eng;
+    auto sid = eng.open_stream();
+
+    std::vector<std::byte> body(40000, std::byte{'x'});
+    eng.send_data(sid, body, false);
+    CHECK(eng.connection_send_window() == 65535 - 40000);
+
+    std::vector<std::byte> wu;
+    http::v2::encode_window_update_frame(wu, 0, 40000);
+    mock::recv(eng, wu);
+    CHECK(eng.connection_send_window() == 65535);
+  }
+
+  SUBCASE("SETTINGS_INITIAL_WINDOW_SIZE adjusts existing and future streams")
+  {
+    engine eng;
+    auto sid = eng.open_stream();
+    CHECK(eng.stream_send_window(sid) == 65535);
+
+    std::vector<http::v2::setting> settings = {
+      {http::v2::settings_id::initial_window_size, 100000}
+    };
+    std::vector<std::byte> sf;
+    http::v2::encode_settings_frame(sf, settings, /*ack=*/false);
+    mock::recv(eng, sf);
+
+    // Existing stream is adjusted by the delta (+34465).
+    CHECK(eng.stream_send_window(sid) == 100000);
+    // The connection-level window is NOT affected by SETTINGS.
+    CHECK(eng.connection_send_window() == 65535);
+    // A stream opened afterwards starts at the updated initial size.
+    auto sid2 = eng.open_stream();
+    CHECK(eng.stream_send_window(sid2) == 100000);
+  }
+
+  SUBCASE("WINDOW_UPDATE split across reads is reassembled")
+  {
+    engine eng;
+    eng.open_stream();
+
+    std::vector<std::byte> wu;
+    http::v2::encode_window_update_frame(wu, 0, 12345);
+    REQUIRE(wu.size() == 13);
+
+    // Deliver the frame as two separate reads: 11 bytes then 2 bytes, splitting
+    // the 4-byte payload across the boundary to exercise reassembly.
+    std::vector<std::byte> part1(wu.begin(), wu.begin() + 11);
+    std::vector<std::byte> part2(wu.begin() + 11, wu.end());
+    mock::recv(eng, part1);
+    mock::recv(eng, part2);
+
+    CHECK(eng.connection_send_window() == 65535 + 12345);
+  }
+}

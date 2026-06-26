@@ -5,6 +5,7 @@
 #include <vector>
 #include <cstring>
 #include <numeric>
+#include <set>
 
 namespace
 {

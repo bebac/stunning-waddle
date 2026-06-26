@@ -12,13 +12,20 @@
 #include <cstring>
 #include <functional>
 #include <map>
-#include <set>
 #include <span>
 #include <string>
 #include <vector>
 
 namespace http::v2
 {
+  // Unified stream flow control state
+  struct stream_flow_state
+  {
+    uint32_t consumed_bytes = 0; // Bytes consumed (incoming flow control)
+    int64_t send_window = 0;     // Send window (outgoing flow control)
+    bool known = false;          // Whether this stream is known/acknowledged
+  };
+
   class engine : public protocol_engine
   {
   private:
@@ -81,7 +88,7 @@ namespace http::v2
     void handle_settings_payload(std::span<const std::byte> payload);
     void handle_goaway_payload(std::span<const std::byte> payload, uint32_t length);
     void apply_peer_initial_window_size(uint32_t new_size);
-    int64_t& get_or_init_stream_send_window(uint32_t stream_id);
+    stream_flow_state& get_or_init_stream_flow_state(uint32_t stream_id);
 
   private:
     void write_preface();
@@ -101,13 +108,11 @@ namespace http::v2
     hpack_context encode_ctx_;
     hpack_context decode_ctx_;
     uint32_t next_stream_id_ = 1;
-    std::set<uint32_t> known_streams_;  // Track streams we know about
 
     // Flow control: track consumed bytes and emit WINDOW_UPDATEs.
     static constexpr uint32_t default_initial_window_size_ = 65535;
     uint32_t initial_window_size_ = default_initial_window_size_;
     uint32_t connection_consumed_ = 0;
-    std::map<uint32_t, uint32_t> stream_consumed_;
 
     // Send-side flow control: the peer's advertised windows that bound how much
     // DATA we may send. The connection-level window is shared across all
@@ -115,7 +120,9 @@ namespace http::v2
     // make a stream window legitimately negative (RFC 7540 6.9.2).
     int64_t connection_send_window_ = default_initial_window_size_;
     uint32_t peer_initial_window_size_ = default_initial_window_size_;
-    std::map<uint32_t, int64_t> stream_send_window_;
+
+    // Unified stream tracking: combines known_streams_, stream_consumed_, and stream_send_window_
+    std::map<uint32_t, stream_flow_state> stream_flow_states_;
 
     // Reassembly buffer for control-frame payloads (WINDOW_UPDATE / SETTINGS),
     // which the parser may deliver across multiple chunks.

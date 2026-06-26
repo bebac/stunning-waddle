@@ -99,8 +99,9 @@ namespace http::v2
       state_ = state::preface_sent;
     }
 
-    known_streams_.insert(id);
-    stream_send_window_[id] = static_cast<int64_t>(peer_initial_window_size_);
+    auto& flow_state = get_or_init_stream_flow_state(id);
+    flow_state.known = true;
+    flow_state.send_window = static_cast<int64_t>(peer_initial_window_size_);
     next_stream_id_ += 2;
     return id;
   }
@@ -185,7 +186,7 @@ namespace http::v2
     {
       auto consumed = static_cast<int64_t>(data.size());
       connection_send_window_ -= consumed;
-      get_or_init_stream_send_window(stream_id) -= consumed;
+      get_or_init_stream_flow_state(stream_id).send_window -= consumed;
     }
   }
 
@@ -222,18 +223,18 @@ namespace http::v2
         update_flow_control(h.stream_id, static_cast<uint32_t>(len));
         if ((h.flags & std::byte{0x01}) != std::byte{0})
         {
-          stream_consumed_.erase(h.stream_id);
-          stream_send_window_.erase(h.stream_id);
+          stream_flow_states_.erase(h.stream_id);
           if (closed_cb_) {
             closed_cb_(h.stream_id);
           }
         }
         break;
-      case frame_type::headers:
+      case frame_type::headers: {
         // Server mode: check if this is a new stream from client
-        if (role_ == connection_role::server && known_streams_.find(h.stream_id) == known_streams_.end())
+        auto& flow_state = get_or_init_stream_flow_state(h.stream_id);
+        if (role_ == connection_role::server && !flow_state.known)
         {
-          known_streams_.insert(h.stream_id);
+          flow_state.known = true;
           if (new_stream_cb_) {
             new_stream_cb_(h.stream_id);
           }
@@ -252,6 +253,7 @@ namespace http::v2
           }
         }
         break;
+      }
       case frame_type::priority:
         //std::cerr << "[http] frame_type::priority unhandled" << std::endl;
         break;
@@ -328,7 +330,8 @@ namespace http::v2
   {
     // Accumulate consumed bytes for both connection and stream.
     connection_consumed_ += bytes_received;
-    stream_consumed_[stream_id] += bytes_received;
+    auto& flow_state = get_or_init_stream_flow_state(stream_id);
+    flow_state.consumed_bytes += bytes_received;
 
     // Send connection-level WINDOW_UPDATE when half the window is consumed.
     uint32_t threshold = initial_window_size_ / 2;
@@ -339,29 +342,30 @@ namespace http::v2
     }
 
     // Send stream-level WINDOW_UPDATE.
-    if (stream_consumed_[stream_id] >= threshold) {
-      encode_window_update_frame(pending_out_, stream_id, stream_consumed_[stream_id]);
-      stream_consumed_[stream_id] = 0;
+    if (flow_state.consumed_bytes >= threshold) {
+      encode_window_update_frame(pending_out_, stream_id, flow_state.consumed_bytes);
+      flow_state.consumed_bytes = 0;
     }
   }
 
-  int64_t& engine::get_or_init_stream_send_window(uint32_t stream_id)
+  stream_flow_state& engine::get_or_init_stream_flow_state(uint32_t stream_id)
   {
-    auto it = stream_send_window_.find(stream_id);
-    if (it == stream_send_window_.end()) {
-      it = stream_send_window_.emplace(
-        stream_id, static_cast<int64_t>(peer_initial_window_size_)).first;
+    auto it = stream_flow_states_.find(stream_id);
+    if (it == stream_flow_states_.end()) {
+      it = stream_flow_states_.emplace(
+        stream_id, stream_flow_state{}).first;
+      it->second.send_window = static_cast<int64_t>(peer_initial_window_size_);
     }
     return it->second;
   }
 
   int64_t engine::stream_send_window(uint32_t stream_id) const
   {
-    auto it = stream_send_window_.find(stream_id);
-    if (it == stream_send_window_.end()) {
+    auto it = stream_flow_states_.find(stream_id);
+    if (it == stream_flow_states_.end()) {
       return static_cast<int64_t>(peer_initial_window_size_);
     }
-    return it->second;
+    return it->second.send_window;
   }
 
   void engine::handle_window_update(uint32_t stream_id, std::span<const std::byte> payload)
@@ -388,7 +392,7 @@ namespace http::v2
       connection_send_window_ += static_cast<int64_t>(increment);
     }
     else {
-      get_or_init_stream_send_window(stream_id) += static_cast<int64_t>(increment);
+      get_or_init_stream_flow_state(stream_id).send_window += static_cast<int64_t>(increment);
     }
   }
 
@@ -472,8 +476,8 @@ namespace http::v2
     int64_t delta = static_cast<int64_t>(new_size) -
                     static_cast<int64_t>(peer_initial_window_size_);
 
-    for (auto& entry : stream_send_window_) {
-      entry.second += delta;
+    for (auto& entry : stream_flow_states_) {
+      entry.second.send_window += delta;
     }
 
     peer_initial_window_size_ = new_size;

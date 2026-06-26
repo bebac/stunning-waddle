@@ -29,6 +29,12 @@ namespace http
     engine_->on_stream_reset([this](uint32_t id, std::error_code ec) {
       dispatch_reset(id, ec);
     });
+
+    engine_->on_goaway([this](uint32_t last_stream_id, uint32_t error_code) {
+      if (on_goaway_) {
+        on_goaway_(last_stream_id, std::error_code(error_code, std::generic_category()));
+      }
+    });
   }
 
   stream context_base::create_stream_with_state(std::shared_ptr<stream_state> state)

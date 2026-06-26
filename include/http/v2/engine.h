@@ -60,6 +60,8 @@ namespace http::v2
     {
     }
 
+    void send_goaway(uint32_t last_stream_id, uint32_t error_code, std::span<const std::byte> debug_data = {});
+
   public:
     // --- Outgoing (send-side) flow-control inspection ---
     //
@@ -76,6 +78,7 @@ namespace http::v2
     bool try_consume_client_preface();
     void handle_window_update(uint32_t stream_id, std::span<const std::byte> payload);
     void handle_settings_payload(std::span<const std::byte> payload);
+    void handle_goaway_payload(std::span<const std::byte> payload, uint32_t length);
     void apply_peer_initial_window_size(uint32_t new_size);
     int64_t& get_or_init_stream_send_window(uint32_t stream_id);
 
@@ -116,6 +119,10 @@ namespace http::v2
     // Reassembly buffer for control-frame payloads (WINDOW_UPDATE / SETTINGS),
     // which the parser may deliver across multiple chunks.
     std::vector<std::byte> control_payload_;
+
+    std::function<void(uint32_t, uint32_t)> goaway_cb_;
+    bool goaway_received_ = false;
+    uint32_t last_goaway_stream_id_ = 0;
   };
 } // namespace http::v2
 

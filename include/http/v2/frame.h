@@ -43,6 +43,12 @@ namespace http::v2
     uint32_t value;
   };
 
+  struct goaway_payload {
+    uint32_t last_stream_id;
+    uint32_t error_code;
+    std::vector<std::byte> debug_data;
+  };
+
   void encode_data_frame(
     std::vector<std::byte>& dst,
     uint32_t stream_id,
@@ -67,6 +73,13 @@ namespace http::v2
     std::vector<std::byte>& dst,
     uint32_t stream_id,
     uint32_t increment
+  );
+
+  void encode_goaway_frame(
+    std::vector<std::byte>& dst,
+    uint32_t last_stream_id,
+    uint32_t error_code,
+    std::span<const std::byte> debug_data = {}
   );
 } // namespace http::v2
 

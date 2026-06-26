@@ -83,6 +83,12 @@ namespace http::v2
 
   uint32_t engine::open_stream()
   {
+    if (goaway_received_)
+    {
+      // TODO - Throw, return "invalid" stream id (maybe max uint32_t?) or
+      // perhpas change to return an std::optional.
+    }
+
     auto id = next_stream_id_;
 
     if (role_ == connection_role::client && state_ == state::idle)
@@ -272,7 +278,16 @@ namespace http::v2
         //std::cerr << "[http] frame_type::ping unhandled" << std::endl;
         break;
       case frame_type::goaway:
-        //std::cerr << "[http] frame_type::goaway unhandled" << std::endl;
+        // Reassemble payload (minimum 8 bytes: last_stream_id + error_code)
+        control_payload_.insert(
+          control_payload_.end(),
+          reinterpret_cast<const std::byte*>(data),
+          reinterpret_cast<const std::byte*>(data) + len);
+
+        if (control_payload_.size() >= h.length) {
+          handle_goaway_payload(control_payload_, h.length);
+          control_payload_.clear();
+        }
         break;
       case frame_type::window_update:
         // Reassemble the 4-byte payload (it may be split across reads) and add
@@ -393,6 +408,55 @@ namespace http::v2
         apply_peer_initial_window_size(value);
       }
     }
+  }
+
+  void engine::handle_goaway_payload(std::span<const std::byte> payload, uint32_t length)
+  {
+    // RFC 7540 6.8: GOAWAY payload is last_stream_id (4 bytes) + error_code (4 bytes) + debug_data
+    if (length < 8) {
+      // FRAME_SIZE_ERROR - but we can't send GOAWAY for this since we're processing GOAWAY
+      return;
+    }
+
+    // Extract last_stream_id (31-bit, MSB must be 0)
+    uint32_t last_stream_id =
+      (std::to_integer<uint32_t>(payload[0]) << 24) |
+      (std::to_integer<uint32_t>(payload[1]) << 16) |
+      (std::to_integer<uint32_t>(payload[2]) << 8) |
+      std::to_integer<uint32_t>(payload[3]);
+
+    // Ensure MSB is 0 (31-bit value)
+    if ((last_stream_id & 0x80000000) != 0) {
+      // Invalid - treat as connection error
+      return;
+    }
+
+    // Extract error_code (32-bit)
+    uint32_t error_code =
+      (std::to_integer<uint32_t>(payload[4]) << 24) |
+      (std::to_integer<uint32_t>(payload[5]) << 16) |
+      (std::to_integer<uint32_t>(payload[6]) << 8) |
+      std::to_integer<uint32_t>(payload[7]);
+
+    // Extract debug data (if any)
+    std::vector<std::byte> debug_data;
+    if (length > 8) {
+      debug_data.assign(payload.begin() + 8, payload.begin() + length);
+    }
+
+    // Update state
+    goaway_received_ = true;
+    last_goaway_stream_id_ = last_stream_id;
+
+    // Invoke callback
+    if (goaway_cb_) {
+      goaway_cb_(last_stream_id, error_code);
+    }
+  }
+
+  void engine::send_goaway(uint32_t last_stream_id, uint32_t error_code, std::span<const std::byte> debug_data)
+  {
+    encode_goaway_frame(pending_out_, last_stream_id, error_code, debug_data);
   }
 
   void engine::apply_peer_initial_window_size(uint32_t new_size)

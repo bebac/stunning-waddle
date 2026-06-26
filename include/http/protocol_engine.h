@@ -33,6 +33,7 @@ namespace http
     using stream_reset_callback = std::function<void(uint32_t, std::error_code)>;
     using headers_callback = std::function<void(uint32_t, const headers&)>;
     using new_stream_callback = std::function<void(uint32_t)>;
+    using goaway_callback = std::function<void(uint32_t last_stream_id, uint32_t error_code)>;
 
   public:
     virtual ~protocol_engine() = default;
@@ -110,12 +111,18 @@ namespace http
       new_stream_cb_ = std::move(cb);
     }
 
+    void on_goaway(goaway_callback cb)
+    {
+      goaway_cb_ = std::move(cb);
+    }
+
   protected:
     headers_callback headers_cb_;
     data_callback data_cb_;
     stream_closed_callback closed_cb_;
     stream_reset_callback reset_cb_;
     new_stream_callback new_stream_cb_;
+    goaway_callback goaway_cb_;
   };
 } // namespace http
 

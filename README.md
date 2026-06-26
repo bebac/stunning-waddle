@@ -51,7 +51,7 @@ The library is split into the core protocol engine and optional adapters.
 
 | Component | Responsibility |
 | --- | --- |
-| **`v2::engine`** | Binary framing, HPACK, and stream state management. |
+| **`v2::engine`** | Binary framing, HPACK, stream state management, and flow control. |
 | **`client_context` and `server_context`** | The "Switchboard" for multiplexing and stream routing. |
 | **`hpack`** | Header compression/decompression. |
 | **`Adapters`** | Glue code for Coroutines. |
@@ -111,7 +111,8 @@ The project is currently **Client-focused**, providing a high-level fluent API f
 * [x] **Multiplexing:** Concurrent stream support.
 * [x] **C++20 Adapters:** Coroutine-based `request_handle` for Clients.
 * [x] **Server Support:** Engine-level support for accepting streams and serving responses.
-* [ ] **Flow Control:** Dynamic `WINDOW_UPDATE` management.
+* [x] **Receive Flow Control:** Automatic `WINDOW_UPDATE` generation based on consumed bytes (both connection and per-stream).
+* [ ] **Send Flow Control:** Enforcement of peer's advertised send windows at the API level (tracking implemented, enforcement pending).
 * [ ] **HTTP/1.1:** Implementation of the text-based engine.
 * [ ] **HTTP/3:** QUIC integration and UDP transport logic.
 

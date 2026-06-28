@@ -82,7 +82,7 @@ namespace http::v2
 
   private:
     void handle_frame_header(frame_header h);
-    void handle_payload_chunk(frame_header h, const uint8_t* data, size_t len);
+    auto handle_payload_chunk(frame_header h, std::span<const std::byte> chunk) -> std::size_t;
     bool try_consume_client_preface();
     void handle_window_update(uint32_t stream_id, std::span<const std::byte> payload);
     void handle_settings_payload(std::span<const std::byte> payload);
@@ -102,7 +102,7 @@ namespace http::v2
     connection_role role_;
     state state_ = state::idle;
     std::array<std::byte, 16384> input_buffer_;
-    size_t input_buffered_ = 0;  // For preface validation
+    size_t input_buffered_ = 0;  // Number of unconsumed bytes at the start of input_buffer_
     std::vector<std::byte> pending_out_;
     frame_parser parser_;
     hpack_context encode_ctx_;
@@ -123,10 +123,6 @@ namespace http::v2
 
     // Unified stream tracking: combines known_streams_, stream_consumed_, and stream_send_window_
     std::map<uint32_t, stream_flow_state> stream_flow_states_;
-
-    // Reassembly buffer for control-frame payloads (WINDOW_UPDATE / SETTINGS),
-    // which the parser may deliver across multiple chunks.
-    std::vector<std::byte> control_payload_;
 
     bool goaway_received_ = false;
     uint32_t last_goaway_stream_id_ = 0;

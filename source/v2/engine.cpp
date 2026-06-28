@@ -28,43 +28,70 @@ namespace http::v2
 
     parser_.on_payload_chunk(
       [this](frame_header h, std::span<const std::byte> buf) {
-        this->handle_payload_chunk(h, reinterpret_cast<const uint8_t*>(buf.data()), buf.size());
+        return this->handle_payload_chunk(h, buf);
       }
     );
   }
 
   std::span<std::byte> engine::input_begin()
   {
-    if (state_ == state::awaiting_preface) {
-      // Server mode: buffer for preface validation
-      return std::span(input_buffer_.data() + input_buffered_,
-                       input_buffer_.size() - input_buffered_);
-    }
-    return std::span(input_buffer_.data(), input_buffer_.size());
+    // Return space after any unconsumed data.
+    return std::span(
+      input_buffer_.data() + input_buffered_,
+      input_buffer_.size() - input_buffered_
+    );
   }
 
   void engine::input_end(size_t n)
   {
     if (n == 0) return;
 
-    if (state_ == state::awaiting_preface) {
-      input_buffered_ += n;
-      if (input_buffered_ >= preface.size() && try_consume_client_preface()) {
+    input_buffered_ += n;
+
+    if (state_ == state::awaiting_preface)
+    {
+      if (input_buffered_ >= preface.size() && try_consume_client_preface())
+      {
         // Preface validated, send our SETTINGS
         write_settings();
         state_ = state::ready;
-        // Process any remaining data after preface (offset past preface)
+        // Process any remaining data after preface
         size_t remaining = input_buffered_ - preface.size();
-        if (remaining > 0) {
-          parser_.consume(std::span<const std::byte>(
-            input_buffer_.data() + preface.size(), remaining));
+        if (remaining > 0)
+        {
+          auto in = std::span(input_buffer_);
+          auto consumed = parser_.consume(in.subspan(preface.size(), remaining));
+          // Slide buffer: move unconsumed data to front
+          if (consumed < remaining) {
+            std::memmove(
+              input_buffer_.data(),
+              input_buffer_.data() + preface.size() + consumed,
+              remaining - consumed
+            );
+          }
+          input_buffered_ = remaining - consumed;
         }
-        input_buffered_ = 0;
+        else {
+          input_buffered_ = 0;
+        }
       }
       return;
     }
 
-    parser_.consume(std::span<const std::byte>(input_buffer_.data(), n));
+    // Process all buffered data through the parser
+    size_t consumed = parser_.consume(
+      std::span<const std::byte>(input_buffer_.data(), input_buffered_)
+    );
+
+    // Slide buffer: move remaining unconsumed data to front
+    if (consumed < input_buffered_) {
+      std::memmove(
+        input_buffer_.data(),
+        input_buffer_.data() + consumed,
+        input_buffered_ - consumed
+      );
+    }
+    input_buffered_ -= consumed;
   }
 
   std::span<const std::byte> engine::output_begin()
@@ -212,15 +239,15 @@ namespace http::v2
     }
   }
 
-  void engine::handle_payload_chunk(frame_header h, const uint8_t* data, size_t len)
+  size_t engine::handle_payload_chunk(frame_header h, std::span<const std::byte> chunk)
   {
     switch (h.type)
     {
       case frame_type::data:
         if (data_cb_) {
-          data_cb_(h.stream_id, data, len);
+          data_cb_(h.stream_id, reinterpret_cast<const uint8_t*>(chunk.data()), chunk.size());
         }
-        update_flow_control(h.stream_id, static_cast<uint32_t>(len));
+        update_flow_control(h.stream_id, chunk.size());
         if ((h.flags & std::byte{0x01}) != std::byte{0})
         {
           stream_flow_states_.erase(h.stream_id);
@@ -241,7 +268,7 @@ namespace http::v2
         }
         if ((h.flags & std::byte(0x04)) != std::byte{0}) // END_HEADERS
         {
-          auto decoded = decode_ctx_.decode(data, len);
+          auto decoded = decode_ctx_.decode(reinterpret_cast<const uint8_t*>(chunk.data()), chunk.size());
           if (headers_cb_) {
             headers_cb_(h.stream_id, http::headers(decoded));
           }
@@ -263,15 +290,11 @@ namespace http::v2
         }
         break;
       case frame_type::settings:
-        // Reassemble the payload (it may arrive in chunks), then apply the
-        // settings we track, e.g. SETTINGS_INITIAL_WINDOW_SIZE for send windows.
-        control_payload_.insert(
-          control_payload_.end(),
-          reinterpret_cast<const std::byte*>(data),
-          reinterpret_cast<const std::byte*>(data) + len);
-        if (control_payload_.size() >= h.length) {
-          handle_settings_payload(control_payload_);
-          control_payload_.clear();
+        if (chunk.size() >= h.length) {
+          handle_settings_payload(chunk);
+        }
+        else {
+          return 0;
         }
         break;
       case frame_type::push_promise:
@@ -281,33 +304,26 @@ namespace http::v2
         //std::cerr << "[http] frame_type::ping unhandled" << std::endl;
         break;
       case frame_type::goaway:
-        // Reassemble payload (minimum 8 bytes: last_stream_id + error_code)
-        control_payload_.insert(
-          control_payload_.end(),
-          reinterpret_cast<const std::byte*>(data),
-          reinterpret_cast<const std::byte*>(data) + len);
-
-        if (control_payload_.size() >= h.length) {
-          handle_goaway_payload(control_payload_, h.length);
-          control_payload_.clear();
+        if (chunk.size() >= h.length) {
+          handle_goaway_payload(chunk, h.length);
+        }
+        else {
+          return 0;
         }
         break;
       case frame_type::window_update:
-        // Reassemble the 4-byte payload (it may be split across reads) and add
-        // the increment to the matching outgoing window (stream 0 = connection).
-        control_payload_.insert(
-          control_payload_.end(),
-          reinterpret_cast<const std::byte*>(data),
-          reinterpret_cast<const std::byte*>(data) + len);
-        if (control_payload_.size() >= h.length) {
-          handle_window_update(h.stream_id, control_payload_);
-          control_payload_.clear();
+        if (chunk.size() >= h.length) {
+          handle_window_update(h.stream_id, chunk);
+        }
+        else {
+          return 0;
         }
         break;
       case frame_type::continuation:
         //std::cerr << "[http] fframe_type::continuation unhandled" << std::endl;
         break;
     }
+    return chunk.size();
   }
 
   void engine::write_preface()

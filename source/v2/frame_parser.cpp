@@ -12,9 +12,10 @@ namespace http::v2
     payload_cb_ = std::move(cb);
   }
 
-  void frame_parser::consume(std::span<const std::byte> buf)
+  size_t frame_parser::consume(std::span<const std::byte> buf)
   {
     size_t offset = 0;
+
     while (offset < buf.size())
     {
       switch (state_)
@@ -39,23 +40,28 @@ namespace http::v2
         case state::reading_payload:
         {
           size_t to_consume = std::min(current_header_.length - payload_bytes_read_, buf.size() - offset);
+          size_t consumed = 0;
 
-          if (payload_cb_ && to_consume > 0)
-          {
-            payload_cb_(current_header_, buf.subspan(offset, to_consume));
+          if (payload_cb_ && to_consume > 0) {
+            consumed = payload_cb_(current_header_, buf.subspan(offset, to_consume));
           }
 
-          offset += to_consume;
-          payload_bytes_read_ += to_consume;
+          offset += consumed;
+          payload_bytes_read_ += consumed;
 
-          if (payload_bytes_read_ == current_header_.length)
-          {
+          if (payload_bytes_read_ == current_header_.length) {
             state_ = state::reading_header;
+          }
+          else if ( consumed < to_consume ) {
+            // Incomplete frame.
+            return offset;
           }
           break;
         }
       }
     }
+
+    return offset; // Return total bytes consumed
   }
 
   void frame_parser::process_header()

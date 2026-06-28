@@ -21,11 +21,11 @@ namespace http::v2
 
   public:
     using frame_header_callback = std::function<void(frame_header)>;
-    using payload_chunk_callback = std::function<void(frame_header, std::span<const std::byte>)>;
+    using payload_chunk_callback = std::function<std::size_t(frame_header, std::span<const std::byte>)>;
 
     void on_frame_header(frame_header_callback cb);
     void on_payload_chunk(payload_chunk_callback cb);
-    void consume(std::span<const std::byte> buf);
+    size_t consume(std::span<const std::byte> buf);
 
   private:
     void process_header();

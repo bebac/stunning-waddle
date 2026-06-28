@@ -384,7 +384,9 @@ namespace http::v2
 
     if (increment == 0) {
       // A zero increment is a PROTOCOL_ERROR per RFC 7540 6.9.
-      // TODO: surface as a connection/stream error once GOAWAY/RST exists.
+      if (conn_error_cb_) {
+        conn_error_cb_(http::make_error_code(http::error_code::protocol_error));
+      }
       return;
     }
 
@@ -433,6 +435,9 @@ namespace http::v2
     // Ensure MSB is 0 (31-bit value)
     if ((last_stream_id & 0x80000000) != 0) {
       // Invalid - treat as connection error
+      if (conn_error_cb_) {
+        conn_error_cb_(http::make_error_code(http::error_code::frame_size_error));
+      }
       return;
     }
 
@@ -488,7 +493,9 @@ namespace http::v2
     // Validate preface (caller already checked we have enough bytes)
     if (std::memcmp(input_buffer_.data(), preface.data(), preface.size()) != 0) {
       // Invalid preface - this is a connection error
-      // TODO: Send GOAWAY and close connection
+      if (conn_error_cb_) {
+        conn_error_cb_(http::make_error_code(http::error_code::protocol_error));
+      }
       return false;
     }
     return true;

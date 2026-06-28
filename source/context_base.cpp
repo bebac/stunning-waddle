@@ -36,6 +36,12 @@ namespace http
         on_goaway_(last_stream_id, http::make_error_code(error_code));
       }
     });
+
+    engine_->on_connection_error([this](std::error_code ec) {
+      if (on_conn_error_) {
+        on_conn_error_(ec);
+      }
+    });
   }
 
   stream context_base::create_stream_with_state(std::shared_ptr<stream_state> state)

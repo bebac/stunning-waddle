@@ -128,7 +128,6 @@ namespace http::v2
     // which the parser may deliver across multiple chunks.
     std::vector<std::byte> control_payload_;
 
-    std::function<void(uint32_t, http::error_code)> goaway_cb_;
     bool goaway_received_ = false;
     uint32_t last_goaway_stream_id_ = 0;
     http::error_code last_goaway_error_code_ = http::error_code::no_error;

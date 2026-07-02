@@ -13,6 +13,7 @@ add_library(stunning-waddle STATIC
     source/stream.cpp
     source/headers.cpp
     source/error_codes.cpp
+    source/sse.cpp
     source/v2/engine.cpp
     source/v2/frame_parser.cpp
     source/v2/frame.cpp

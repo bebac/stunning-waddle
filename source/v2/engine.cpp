@@ -185,6 +185,7 @@ namespace http::v2
 
     // TODO: Handle splitting header block into CONTINUATION frames if needed
     encode_headers_frame(pending_out_, stream_id, header_block, true, end_stream);
+    maybe_invoke_output_ready();
   }
 
   void engine::send_data(uint32_t stream_id, std::span<const std::byte> data, bool end_stream)
@@ -204,6 +205,7 @@ namespace http::v2
       encode_data_frame(pending_out_, stream_id, data.subspan(offset - chunk_size, chunk_size), final_flag);
     }
     while (offset < data.size());
+    maybe_invoke_output_ready();
 
     // Track outgoing flow-control consumption. NOTE: we intentionally do not
     // gate/queue here yet — send_data still emits the whole body. Honoring the
@@ -226,6 +228,7 @@ namespace http::v2
       {
         // Automatically send SETTINGS ACK
         encode_settings_frame(pending_out_, {}, true);
+        maybe_invoke_output_ready();
       }
     }
     else
@@ -334,12 +337,14 @@ namespace http::v2
       reinterpret_cast<const std::byte*>(preface.data()),
       reinterpret_cast<const std::byte*>(preface.data()) + preface.size()
     );
+    maybe_invoke_output_ready();
   }
 
   void engine::write_settings()
   {
     // Queue initial empty SETTINGS frame
     encode_settings_frame(pending_out_, {}, false);
+    maybe_invoke_output_ready();
   }
 
   void engine::update_flow_control(uint32_t stream_id, uint32_t bytes_received)
@@ -355,12 +360,14 @@ namespace http::v2
     if (connection_consumed_ >= threshold) {
       encode_window_update_frame(pending_out_, 0, connection_consumed_);
       connection_consumed_ = 0;
+      maybe_invoke_output_ready();
     }
 
     // Send stream-level WINDOW_UPDATE.
     if (flow_state.consumed_bytes >= threshold) {
       encode_window_update_frame(pending_out_, stream_id, flow_state.consumed_bytes);
       flow_state.consumed_bytes = 0;
+      maybe_invoke_output_ready();
     }
   }
 

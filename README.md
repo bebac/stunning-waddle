@@ -76,8 +76,8 @@ ctest -V
 ## Design Overview
 
 `stunning-waddle` follows the **Sans-I/O** philosophy. The library implements the state machines for HTTP/1.1, H2, and HPACK as pure data-processing engines. It does not perform any system calls, manage sockets, or handle encryption.
-
 ### Driving the Engine
+
 You "drive" the protocol by acting as the bridge between the network and the engine. This makes integration with any event loop (like `epoll`, `io_uring`, or `asio`) trivial.
 
 1. **Input:** Pass raw bytes from your transport (TCP/TLS) into the engine.
@@ -100,6 +100,53 @@ void sync_io(http::client_context& ctx, auto& socket) {
     }
 }
 ```
+
+#### Output Readiness: Level-Triggered vs Edge-Triggered Driving
+
+The library provides two mechanisms for determining when there is output to send:
+
+**Level-Triggered (Polling):** Use `has_output()` to check if there is pending data before each I/O operation. This is ideal for simple loops or level-triggered event systems like `poll()`:
+
+```cpp
+// Level-triggered example with poll()
+pollfd pfd{.fd = socket_fd, .events = POLLIN};
+if (ctx.has_output()) {
+    pfd.events |= POLLOUT;  // Only request writability when we have data
+}
+poll(&pfd, 1, timeout_ms);
+
+if (pfd.revents & POLLOUT) {
+    auto out = ctx.output_begin();
+    if (!out.empty()) {
+        ssize_t n = send(pfd.fd, out.data(), out.size(), 0);
+        ctx.output_end(n);
+    }
+}
+```
+
+**Edge-Triggered (Event-Driven):** Use `on_output_ready()` to register a callback that fires when the engine transitions from having no output to having output. This is ideal for edge-triggered systems like `epoll` or `io_uring`, or to wake a sleeping event loop:
+
+```cpp
+// Edge-triggered example with epoll
+ctx.on_output_ready([&]() {
+    // Signal the event loop (e.g., via eventfd, self-pipe, or uv_async)
+    event_loop.wake();
+});
+
+// In event loop: when EPOLLOUT fires
+while (ctx.has_output()) {
+    auto out = ctx.output_begin();
+    ssize_t n = send(socket_fd, out.data(), out.size(), MSG_DONTWAIT);
+    ctx.output_end(n);
+    if (n < 0 && errno == EAGAIN) break;
+}
+```
+
+**Key Differences:**
+- **Level-triggered:** Simple, works well with polling. Must re-check `has_output()` before each write attempt.
+- **Edge-triggered:** More efficient for high-scale I/O multiplexing. The callback fires once when output becomes available; you must drain all output in your event handler.
+
+Both approaches can be used together: use `on_output_ready()` to wake your event loop, then use `has_output()` in a loop to drain all pending output.
 
 ---
 

@@ -60,6 +60,31 @@ namespace http
     virtual auto output_begin() -> std::span<const std::byte> = 0;
     virtual void output_end(size_t n) = 0;
 
+    // Output readiness notification
+    // 
+    // has_output() returns true if there is pending data to send.
+    // Use this for level-triggered driving: check before each I/O operation
+    // or poll() call to determine if POLLOUT should be requested.
+    //
+    // on_output_ready() registers a callback that is invoked when the engine
+    // transitions from having no output to having output (edge-triggered).
+    // Use this for edge-triggered driving (e.g., with epoll, io_uring, or
+    // to wake a sleeping event loop). The callback is invoked synchronously
+    // from the point where output is added, so it should not perform I/O
+    // directly but rather signal the event loop (e.g., via eventfd, self-pipe).
+    //
+    // Level-triggered example:
+    //   while (engine->has_output()) { poll with POLLOUT; write; }
+    //
+    // Edge-triggered example:
+    //   engine->on_output_ready([&] { event_loop.wake(); });
+    //   // In event loop: when POLLOUT fires, write until WANT_WRITE
+    //
+    virtual bool has_output() const = 0;
+
+    using output_ready_callback = std::function<void()>;
+    virtual void on_output_ready(output_ready_callback cb) = 0;
+
     //
     // --- Stream interface ---
     //
@@ -131,6 +156,7 @@ namespace http
     new_stream_callback new_stream_cb_;
     goaway_callback goaway_cb_;
     connection_error_callback conn_error_cb_;
+    output_ready_callback output_ready_cb_;
   };
 } // namespace http
 

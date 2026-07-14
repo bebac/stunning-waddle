@@ -22,6 +22,10 @@ namespace http
     auto output_begin() { return engine_->output_begin(); }
     void output_end(size_t n) { engine_->output_end(n); }
 
+    // Output readiness interface
+    bool has_output() const { return engine_->has_output(); }
+    void on_output_ready(std::function<void()> cb) { engine_->on_output_ready(std::move(cb)); }
+
     // Stream management
     auto active_streams() const -> std::size_t { return streams_.size(); }
 

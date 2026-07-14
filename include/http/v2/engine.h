@@ -70,6 +70,19 @@ namespace http::v2
 
     void send_goaway(uint32_t last_stream_id, http::error_code error_code, std::span<const std::byte> debug_data = {});
 
+    // Output readiness interface
+    bool has_output() const override { return !pending_out_.empty(); }
+    void on_output_ready(output_ready_callback cb) override { output_ready_cb_ = std::move(cb); }
+
+  private:
+    // Helper to invoke output_ready callback when pending_out_ transitions from empty to non-empty
+    void maybe_invoke_output_ready()
+    {
+      if (!pending_out_.empty() && output_ready_cb_) {
+        output_ready_cb_();
+      }
+    }
+
   public:
     // --- Outgoing (send-side) flow-control inspection ---
     //

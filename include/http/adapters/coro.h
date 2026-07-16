@@ -6,6 +6,7 @@
 #include <charconv>
 #include <coroutine>
 #include <exception>
+#include <memory>
 #include <span>
 #include <string>
 #include <system_error>
@@ -106,56 +107,32 @@ namespace http
 
   // --- HTTP Awaiter & Handle ---
 
-  struct response_awaiter {
-    http::stream stream;
-    std::string method, path, host, body;
-    headers request_headers;
-
+  struct response_state
+  {
     response res{};
     std::error_code ec{};
     std::coroutine_handle<> continuation{};
+    bool completed = false;
+  };
+
+  struct response_awaiter {
+    std::shared_ptr<response_state> state;
 
     bool await_ready() const noexcept
     {
-      return false;
+      return state->completed;
     }
 
     void await_suspend(std::coroutine_handle<> handle)
     {
-      continuation = handle;
-
-      stream.on_headers([this](const headers& h) {
-        res.response_headers = h;
-        auto status = h.get(":status");
-        if (!status.empty())
-        {
-          std::from_chars(status.data(), status.data() + status.size(), res.status_code);
-        }
-      });
-
-      stream.on_data([this](std::span<const std::byte> data) {
-        res.text.append(reinterpret_cast<const char*>(data.data()), data.size());
-      });
-
-      stream.on_end([this]() { continuation.resume(); });
-      stream.on_reset([this](std::error_code error) {
-        ec = error;
-        continuation.resume();
-      });
-
-      bool has_body = !body.empty();
-      stream.send_headers(method, path, host, request_headers, !has_body);
-      if (has_body)
-      {
-        stream.send_data({reinterpret_cast<const std::byte*>(body.data()), body.size()}, true);
-      }
+      state->continuation = handle;
     }
 
     response await_resume()
     {
-      if (ec)
-        throw std::system_error(ec);
-      return std::move(res);
+      if (state->ec)
+        throw std::system_error(state->ec);
+      return std::move(state->res);
     }
   };
 
@@ -188,14 +165,47 @@ namespace http
       {
         h.add("content-length", std::to_string(body.size()));
       }
-      return response_awaiter{
-        std::move(stream_),
-        std::string(method_),
-        std::string(path_),
-        std::string(host_),
-        std::string(body),
-        std::move(h)
-      };
+
+      // Create shared state for this request
+      auto state = std::make_shared<response_state>();
+
+      // Set up callbacks on the stream
+      stream_.on_headers([state](const headers& headers) {
+        state->res.response_headers = headers;
+        auto status = headers.get(":status");
+        if (!status.empty())
+        {
+          std::from_chars(status.data(), status.data() + status.size(), state->res.status_code);
+        }
+      });
+
+      stream_.on_data([state](std::span<const std::byte> data) {
+        state->res.text.append(reinterpret_cast<const char*>(data.data()), data.size());
+      });
+
+      stream_.on_end([state]() {
+        state->completed = true;
+        if (state->continuation)
+          state->continuation.resume();
+      });
+
+      stream_.on_reset([state](std::error_code error) {
+        state->ec = error;
+        state->completed = true;
+        if (state->continuation)
+          state->continuation.resume();
+      });
+
+      // Send request immediately (eager start)
+      bool has_body = !body.empty();
+      stream_.send_headers(method_, path_, host_, h, !has_body);
+      if (has_body)
+      {
+        stream_.send_data({reinterpret_cast<const std::byte*>(body.data()), body.size()}, true);
+      }
+
+      // Return thin awaiter with shared state
+      return response_awaiter{state};
     }
 
   private:

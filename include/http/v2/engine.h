@@ -62,7 +62,7 @@ namespace http::v2
       bool end_stream
     ) override;
 
-    void send_data(uint32_t stream_id, std::span<const std::byte> data, bool end_stream) override;
+    size_t send_data(uint32_t stream_id, std::span<const std::byte> data, bool end_stream) override;
 
     void send_reset([[maybe_unused ]] uint32_t stream_id, [[maybe_unused ]] std::error_code ec) override
     {
@@ -83,6 +83,31 @@ namespace http::v2
       }
     }
 
+    // Notify when a stream's send window transitions from <=0 to >0.
+    // Only fires if the connection-level window is also > 0.
+    void notify_stream_window_available(uint32_t stream_id)
+    {
+      if (connection_send_window_ > 0 && stream_window_available_cb_) {
+        stream_window_available_cb_(stream_id);
+      }
+    }
+
+    // Notify when the connection send window transitions from <=0 to >0.
+    // Also notifies all streams whose stream-level window is already > 0.
+    void notify_connection_window_available()
+    {
+      if (conn_window_available_cb_) {
+        conn_window_available_cb_();
+      }
+      if (stream_window_available_cb_) {
+        for (const auto& [id, state] : stream_flow_states_) {
+          if (state.send_window > 0) {
+            stream_window_available_cb_(id);
+          }
+        }
+      }
+    }
+
   public:
     // --- Outgoing (send-side) flow-control inspection ---
     //
@@ -90,8 +115,8 @@ namespace http::v2
     // window (stream 0) is shared by all streams; each stream also has its own
     // window. These are tracked from received WINDOW_UPDATE/SETTINGS frames but
     // are not yet enforced by send_data.
-    int64_t connection_send_window() const { return connection_send_window_; }
-    int64_t stream_send_window(uint32_t stream_id) const;
+    int64_t connection_send_window() const override { return connection_send_window_; }
+    int64_t stream_send_window(uint32_t stream_id) const override;
 
   private:
     void handle_frame_header(frame_header h);

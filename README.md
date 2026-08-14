@@ -159,7 +159,10 @@ The project is currently **Client-focused**, providing a high-level fluent API f
 * [x] **C++20 Adapters:** Coroutine-based `request_handle` for Clients.
 * [x] **Server Support:** Engine-level support for accepting streams and serving responses.
 * [x] **Receive Flow Control:** Automatic `WINDOW_UPDATE` generation based on consumed bytes (both connection and per-stream).
-* [ ] **Send Flow Control:** Enforcement of peer's advertised send windows at the API level (tracking implemented, enforcement pending).
+* [x] **Send Flow Control:** Enforcement of peer's advertised send windows with partial sends, window availability callbacks (stream and connection level), and immediate invocation when windows are already open.
+* [ ] **Streaming Request Bodies:** Replace the eager-copy body model in `request_handle::execute()` with a producer or sink-style API so large request bodies can be streamed without buffering the entire payload in memory.
+* [ ] **Streaming Response Bodies:** Avoid buffering the full response body in `response_state::res.text`; provide an async iterator or callback-based interface so consumers can process response data incrementally as it arrives.
+* [ ] **SSE Event Streaming:** Coroutine adapter wrapping `sse_parser` so consumers can `co_await` individual `sse_event` values from a long-lived stream, with proper integration into the `on_data` / flow-control lifecycle.
 * [ ] **HTTP/1.1:** Implementation of the text-based engine.
 * [ ] **HTTP/3:** QUIC integration and UDP transport logic.
 

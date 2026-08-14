@@ -24,6 +24,7 @@ add_executable(unit_tests
     test_server_context.cpp
     test_server_engine.cpp
     test_context_callbacks.cpp
+    test_send_flow_control.cpp
     test_main.cpp
 )
 

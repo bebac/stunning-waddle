@@ -113,6 +113,12 @@ namespace http
     std::error_code ec{};
     std::coroutine_handle<> continuation{};
     bool completed = false;
+
+    // Pending request body data that hasn't been fully sent yet due to
+    // flow control window exhaustion. `send_offset` tracks how many bytes
+    // have been accepted by the engine so far.
+    std::vector<std::byte> pending_body;
+    size_t send_offset = 0;
   };
 
   struct response_awaiter {
@@ -201,7 +207,31 @@ namespace http
       stream_.send_headers(method_, path_, host_, h, !has_body);
       if (has_body)
       {
-        stream_.send_data({reinterpret_cast<const std::byte*>(body.data()), body.size()}, true);
+        state->pending_body.assign(
+          reinterpret_cast<const std::byte*>(body.data()),
+          reinterpret_cast<const std::byte*>(body.data()) + body.size());
+
+        // Attempt initial send. If the window is exhausted before all data
+        // is sent, register on_window_available to send the remainder.
+        auto try_send_remaining = [this, state]() {
+          if (state->send_offset >= state->pending_body.size()) return;
+
+          size_t remaining = state->pending_body.size() - state->send_offset;
+          size_t sent = stream_.send_data(
+            std::span<const std::byte>(state->pending_body.data() + state->send_offset, remaining),
+            true);
+          state->send_offset += sent;
+        };
+
+        try_send_remaining();
+
+        if (state->send_offset < state->pending_body.size())
+        {
+          // Window exhausted — resume when flow control window becomes available.
+          stream_.on_window_available([state, try_send_remaining = std::move(try_send_remaining)]() {
+            try_send_remaining();
+          });
+        }
       }
 
       // Return thin awaiter with shared state

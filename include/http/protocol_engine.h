@@ -36,6 +36,8 @@ namespace http
     using new_stream_callback = std::function<void(uint32_t)>;
     using goaway_callback = std::function<void(uint32_t last_stream_id, http::error_code error_code)>;
     using connection_error_callback = std::function<void(std::error_code)>;
+    using connection_window_available_callback = std::function<void()>;
+    using stream_window_available_callback = std::function<void(uint32_t)>;
 
   public:
     virtual ~protocol_engine() = default;
@@ -108,8 +110,12 @@ namespace http
       bool end_stream
     ) = 0;
 
-    virtual void send_data(uint32_t stream_id, std::span<const std::byte> data, bool end_stream) = 0;
+    virtual size_t send_data(uint32_t stream_id, std::span<const std::byte> data, bool end_stream) = 0;
     virtual void send_reset(uint32_t stream_id, std::error_code ec) = 0;
+
+    // --- Flow control window inspection ---
+    virtual int64_t connection_send_window() const = 0;
+    virtual int64_t stream_send_window(uint32_t stream_id) const = 0;
 
   public:
     void on_headers(headers_callback cb)
@@ -148,6 +154,16 @@ namespace http
       conn_error_cb_ = std::move(cb);
     }
 
+    void on_connection_window_available(connection_window_available_callback cb)
+    {
+      conn_window_available_cb_ = std::move(cb);
+    }
+
+    void on_stream_window_available(stream_window_available_callback cb)
+    {
+      stream_window_available_cb_ = std::move(cb);
+    }
+
   protected:
     headers_callback headers_cb_;
     data_callback data_cb_;
@@ -157,6 +173,8 @@ namespace http
     goaway_callback goaway_cb_;
     connection_error_callback conn_error_cb_;
     output_ready_callback output_ready_cb_;
+    connection_window_available_callback conn_window_available_cb_;
+    stream_window_available_callback stream_window_available_cb_;
   };
 } // namespace http
 

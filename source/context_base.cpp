@@ -13,6 +13,11 @@ namespace http
     on_conn_error_ = std::move(cb);
   }
 
+  void context_base::on_connection_window_available(std::function<void()> cb)
+  {
+    on_conn_window_available_ = std::move(cb);
+  }
+
   void context_base::register_common_callbacks()
   {
     engine_->on_headers([this](uint32_t id, const headers& h) {
@@ -40,6 +45,20 @@ namespace http
     engine_->on_connection_error([this](std::error_code ec) {
       if (on_conn_error_) {
         on_conn_error_(ec);
+      }
+    });
+
+    engine_->on_stream_window_available([this](uint32_t stream_id) {
+      if (auto it = streams_.find(stream_id); it != streams_.end()) {
+        if (auto& cb = it->second->on_window_available) {
+          cb();
+        }
+      }
+    });
+
+    engine_->on_connection_window_available([this]() {
+      if (on_conn_window_available_) {
+        on_conn_window_available_();
       }
     });
   }

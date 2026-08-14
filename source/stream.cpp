@@ -49,21 +49,23 @@ namespace http
     impl_->headers_sent = true;
   }
 
-  void stream::send_data(std::span<const std::byte> data, bool end_stream)
+  size_t stream::send_data(std::span<const std::byte> data, bool end_stream)
   {
     if (!impl_) {
-      return;
+      return 0;
     }
     if (!impl_->headers_sent)
     {
       // TODO: Should this set an error state or throw?
-      return;
+      return 0;
     }
-    impl_->send_data_fn(impl_->id, data, end_stream);
-    if (end_stream)
+    size_t sent = impl_->send_data_fn(impl_->id, data, end_stream);
+    // Only transition state if END_STREAM was actually sent (all data accepted).
+    if (end_stream && sent == data.size())
     {
       impl_->state = stream_state_enum::half_closed_local;
     }
+    return sent;
   }
 
   void stream::send_end()
@@ -97,6 +99,33 @@ namespace http
     if (impl_) {
       impl_->on_reset = std::move(cb);
     }
+  }
+
+  void stream::on_window_available(std::function<void()> cb)
+  {
+    if (impl_) {
+      impl_->on_window_available = std::move(cb);
+      // Invoke immediately if both windows are already available.
+      if (stream_send_window() > 0 && connection_send_window() > 0) {
+        impl_->on_window_available();
+      }
+    }
+  }
+
+  int64_t stream::stream_send_window() const
+  {
+    if (impl_ && impl_->stream_send_window_fn) {
+      return impl_->stream_send_window_fn(impl_->id);
+    }
+    return 0;
+  }
+
+  int64_t stream::connection_send_window() const
+  {
+    if (impl_ && impl_->connection_send_window_fn) {
+      return impl_->connection_send_window_fn();
+    }
+    return 0;
   }
 
   uint32_t stream::id() const

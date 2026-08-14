@@ -30,13 +30,18 @@ namespace http
     // Pre-bound send functions (stream doesn't need to know about engine)
     std::function<void(uint32_t, std::string_view, std::string_view, std::string_view, const headers&, bool)> send_request_headers_fn;
     std::function<void(uint32_t, int, const headers&, bool)> send_response_headers_fn;
-    std::function<void(uint32_t, std::span<const std::byte>, bool)> send_data_fn;
+    std::function<size_t(uint32_t, std::span<const std::byte>, bool)> send_data_fn;
+
+    // Pre-bound window query functions (stream doesn't need to know about engine)
+    std::function<int64_t(uint32_t)> stream_send_window_fn;
+    std::function<int64_t()> connection_send_window_fn;
 
     // Callbacks (set by user via stream handle)
     std::function<void(const headers&)> on_headers;
     std::function<void(std::span<const std::byte>)> on_data;
     std::function<void()> on_end;
     std::function<void(std::error_code)> on_reset;
+    std::function<void()> on_window_available;
   };
 
   class stream
@@ -67,7 +72,7 @@ namespace http
 
     // --- Common: send data ---
 
-    void send_data(std::span<const std::byte> data, bool end_stream = false);
+    size_t send_data(std::span<const std::byte> data, bool end_stream = false);
     void send_end();
 
     // --- Callbacks ---
@@ -76,6 +81,17 @@ namespace http
     void on_data(std::function<void(std::span<const std::byte>)> cb);
     void on_end(std::function<void()> cb);
     void on_reset(std::function<void(std::error_code)> cb);
+
+    // --- Flow control ---
+
+    // Register a callback invoked when the stream's send window transitions
+    // from exhausted (<=0) to available (>0). If both windows are already
+    // available when the callback is registered, it is invoked immediately.
+    void on_window_available(std::function<void()> cb);
+
+    // Query current send windows.
+    int64_t stream_send_window() const;
+    int64_t connection_send_window() const;
 
     // --- State accessors ---
 

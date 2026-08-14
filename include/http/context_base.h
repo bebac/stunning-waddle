@@ -32,6 +32,7 @@ namespace http
     // Connection-level events
     void on_goaway(std::function<void(uint32_t last_stream_id, std::error_code)> cb);
     void on_connection_error(std::function<void(std::error_code)> cb);
+    void on_connection_window_available(std::function<void()> cb);
 
   protected:
     context_base() = default;
@@ -55,6 +56,7 @@ namespace http
     std::map<uint32_t, std::shared_ptr<stream_state>> streams_;
     std::function<void(uint32_t, std::error_code)> on_goaway_;
     std::function<void(std::error_code)> on_conn_error_;
+    std::function<void()> on_conn_window_available_;
   };
 }
 

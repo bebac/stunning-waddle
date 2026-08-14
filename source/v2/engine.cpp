@@ -96,11 +96,7 @@ namespace http::v2
 
   std::span<const std::byte> engine::output_begin()
   {
-    if ( pending_out_.size() > connection_send_window())
-    {
-      // TODO - What should we do if we have more outgoing data than connection send window allows?
-    }
-    return std::span(reinterpret_cast<const std::byte*>(pending_out_.data()), pending_out_.size());
+    return std::span(pending_out_.data(), pending_out_.size());
   }
 
   void engine::output_end(size_t n)
@@ -188,35 +184,50 @@ namespace http::v2
     maybe_invoke_output_ready();
   }
 
-  void engine::send_data(uint32_t stream_id, std::span<const std::byte> data, bool end_stream)
+  size_t engine::send_data(uint32_t stream_id, std::span<const std::byte> data, bool end_stream)
   {
-    const size_t max_size = 16384;
+    // Empty DATA frame with END_STREAM: allowed even when window is exhausted
+    // (empty frames consume zero flow control credit per RFC 7540 6.9.1).
+    if (data.empty())
+    {
+      if (end_stream)
+      {
+        encode_data_frame(pending_out_, stream_id, {}, true);
+        maybe_invoke_output_ready();
+      }
+      return 0;
+    }
 
+    // Determine available window (minimum of connection and stream windows).
+    int64_t available = std::min(connection_send_window_, stream_send_window(stream_id));
+    if (available <= 0) return 0;
+
+    size_t total_to_send = static_cast<size_t>(
+      std::min(static_cast<int64_t>(data.size()), available));
+    if (total_to_send == 0) return 0;
+
+    // Send in chunks up to max frame size.
+    const size_t max_frame_size = 16384;
     size_t offset = 0;
     do
     {
-      size_t chunk_size = std::min(data.size() - offset, max_size);
-
+      size_t chunk_size = std::min(total_to_send - offset, max_frame_size);
       offset += chunk_size;
 
-      bool is_last_chunk = (offset == data.size());
-      bool final_flag = is_last_chunk && end_stream;
+      // Only set END_STREAM if all data was accepted.
+      bool final_flag = (offset == data.size()) && end_stream;
 
       encode_data_frame(pending_out_, stream_id, data.subspan(offset - chunk_size, chunk_size), final_flag);
     }
-    while (offset < data.size());
+    while (offset < total_to_send);
+
     maybe_invoke_output_ready();
 
-    // Track outgoing flow-control consumption. NOTE: we intentionally do not
-    // gate/queue here yet — send_data still emits the whole body. Honoring the
-    // window before sending needs async coordination with the I/O pump and is a
-    // follow-up. Keeping the counters accurate is the prerequisite for that.
-    if (!data.empty())
-    {
-      auto consumed = static_cast<int64_t>(data.size());
-      connection_send_window_ -= consumed;
-      get_or_init_stream_flow_state(stream_id).send_window -= consumed;
-    }
+    // Decrement windows by actual bytes sent.
+    connection_send_window_ -= static_cast<int64_t>(total_to_send);
+    get_or_init_stream_flow_state(stream_id).send_window -= static_cast<int64_t>(total_to_send);
+
+    return total_to_send;
   }
 
   void engine::handle_frame_header(frame_header h)
@@ -414,10 +425,19 @@ namespace http::v2
     }
 
     if (stream_id == 0) {
+      int64_t old = connection_send_window_;
       connection_send_window_ += static_cast<int64_t>(increment);
+      if (old <= 0 && connection_send_window_ > 0) {
+        notify_connection_window_available();
+      }
     }
     else {
-      get_or_init_stream_flow_state(stream_id).send_window += static_cast<int64_t>(increment);
+      auto& flow_state = get_or_init_stream_flow_state(stream_id);
+      int64_t old = flow_state.send_window;
+      flow_state.send_window += static_cast<int64_t>(increment);
+      if (old <= 0 && flow_state.send_window > 0) {
+        notify_stream_window_available(stream_id);
+      }
     }
   }
 
@@ -505,7 +525,11 @@ namespace http::v2
                     static_cast<int64_t>(peer_initial_window_size_);
 
     for (auto& entry : stream_flow_states_) {
+      int64_t old = entry.second.send_window;
       entry.second.send_window += delta;
+      if (old <= 0 && entry.second.send_window > 0) {
+        notify_stream_window_available(entry.first);
+      }
     }
 
     peer_initial_window_size_ = new_size;

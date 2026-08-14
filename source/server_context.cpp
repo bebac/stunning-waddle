@@ -48,8 +48,16 @@ namespace http
       engine_->send_response_headers(stream_id, status_code, h, end_stream);
     };
 
-    state->send_data_fn = [this](uint32_t stream_id, std::span<const std::byte> data, bool end_stream) {
-      engine_->send_data(stream_id, data, end_stream);
+    state->send_data_fn = [this](uint32_t stream_id, std::span<const std::byte> data, bool end_stream) -> size_t {
+      return engine_->send_data(stream_id, data, end_stream);
+    };
+
+    state->stream_send_window_fn = [this](uint32_t stream_id) -> int64_t {
+      return engine_->stream_send_window(stream_id);
+    };
+
+    state->connection_send_window_fn = [this]() -> int64_t {
+      return engine_->connection_send_window();
     };
 
     return create_stream_with_state(state);

@@ -17,6 +17,28 @@ namespace
     http::v2::encode_data_frame(frame, stream_id, payload, end_stream);
     return frame;
   }
+
+  // Build a raw frame with arbitrary type, flags, and stream_id, with zero
+  // payload. Useful for constructing frames like PING ACK that have no
+  // dedicated encoder in the test helpers.
+  std::vector<std::byte> make_empty_frame(uint8_t type, uint8_t flags, uint32_t stream_id)
+  {
+    std::vector<std::byte> frame;
+    // Length: 0
+    frame.push_back(std::byte{0x00});
+    frame.push_back(std::byte{0x00});
+    frame.push_back(std::byte{0x00});
+    // Type
+    frame.push_back(static_cast<std::byte>(type));
+    // Flags
+    frame.push_back(static_cast<std::byte>(flags));
+    // Stream ID (31-bit, MSB reserved)
+    frame.push_back(static_cast<std::byte>((stream_id >> 24) & 0x7F));
+    frame.push_back(static_cast<std::byte>((stream_id >> 16) & 0xFF));
+    frame.push_back(static_cast<std::byte>((stream_id >> 8) & 0xFF));
+    frame.push_back(static_cast<std::byte>(stream_id & 0xFF));
+    return frame;
+  }
 }
 
 TEST_CASE("WINDOW_UPDATE frame encoding")
@@ -346,5 +368,182 @@ TEST_CASE("Engine flow control: outgoing (send-side) window tracking")
     mock::recv(eng, part2);
 
     CHECK(eng.connection_send_window() == 65535 + 12345);
+  }
+}
+
+TEST_CASE("END_STREAM flag only fires closed_cb_ for DATA and HEADERS")
+{
+  http::v2::engine engine;
+  auto stream_id = engine.open_stream();
+
+  // Drain startup output.
+  mock::skip_preface(engine);
+  while (auto f = mock::capture_frame(engine)) {}
+
+  SUBCASE("Zero-length PING ACK does not fire closed_cb_")
+  {
+    bool stream_closed = false;
+    engine.on_stream_closed([&](uint32_t) { stream_closed = true; });
+
+    // PING ACK: type=0x06, flags=0x01 (ACK), length=0, stream_id=0.
+    // Flag 0x01 is ACK for PING, not END_STREAM. Before the fix this would
+    // spuriously fire closed_cb_ because any zero-length frame with flag
+    // 0x01 was treated as END_STREAM.
+    auto ping_ack = make_empty_frame(0x06, 0x01, 0);
+    mock::recv(engine, ping_ack);
+
+    CHECK_FALSE(stream_closed);
+  }
+
+  SUBCASE("Zero-length DATA with END_STREAM still fires closed_cb_")
+  {
+    bool stream_closed = false;
+    engine.on_stream_closed([&](uint32_t id) {
+      CHECK(id == stream_id);
+      stream_closed = true;
+    });
+
+    // DATA with END_STREAM and zero payload — should still fire closed_cb_.
+    auto df = make_data_frame(stream_id, 0, /*end_stream=*/true);
+    mock::recv(engine, df);
+
+    CHECK(stream_closed);
+  }
+}
+
+TEST_CASE("set_initial_window_size produces SETTINGS and WINDOW_UPDATE")
+{
+  http::v2::engine engine;
+
+  // Must be called before open_stream() so SETTINGS includes the value.
+  engine.set_initial_window_size(1048576);
+
+  auto stream_id = engine.open_stream();
+
+  // Drain preface.
+  mock::skip_preface(engine);
+
+  // First frame should be SETTINGS with initial_window_size = 1048576.
+  auto settings_frame = mock::capture_frame(engine);
+  REQUIRE(settings_frame.has_value());
+  CHECK(settings_frame->type == 0x04);  // SETTINGS
+  CHECK(settings_frame->length == 6);   // One setting entry (6 bytes)
+
+  // Parse the setting: u16 id, u32 value (big-endian).
+  REQUIRE(settings_frame->payload.size() == 6);
+  uint16_t setting_id =
+    (static_cast<uint16_t>(settings_frame->payload[0]) << 8) |
+    static_cast<uint16_t>(settings_frame->payload[1]);
+  uint32_t setting_value =
+    (static_cast<uint32_t>(settings_frame->payload[2]) << 24) |
+    (static_cast<uint32_t>(settings_frame->payload[3]) << 16) |
+    (static_cast<uint32_t>(settings_frame->payload[4]) << 8) |
+    static_cast<uint32_t>(settings_frame->payload[5]);
+
+  CHECK(setting_id == static_cast<uint16_t>(http::v2::settings_id::initial_window_size));
+  CHECK(setting_value == 1048576);
+
+  // Second frame should be WINDOW_UPDATE on stream 0 for the delta.
+  // Delta = 1048576 - 65535 = 983041.
+  auto wu_frame = mock::capture_frame(engine);
+  REQUIRE(wu_frame.has_value());
+  CHECK(wu_frame->type == 0x08);  // WINDOW_UPDATE
+  CHECK(wu_frame->stream_id == 0);
+  REQUIRE(wu_frame->payload.size() == 4);
+  uint32_t increment =
+    (static_cast<uint32_t>(wu_frame->payload[0] & std::byte(0x7F)) << 24) |
+    (static_cast<uint32_t>(wu_frame->payload[1]) << 16) |
+    (static_cast<uint32_t>(wu_frame->payload[2]) << 8) |
+    static_cast<uint32_t>(wu_frame->payload[3]);
+  CHECK(increment == 1048576 - 65535);
+
+  // No more frames.
+  CHECK_FALSE(mock::capture_frame(engine).has_value());
+}
+
+TEST_CASE("Receive-side flow control enforcement")
+{
+  http::v2::engine engine;
+  auto stream_id = engine.open_stream();
+
+  // Drain startup output.
+  mock::skip_preface(engine);
+  while (auto f = mock::capture_frame(engine)) {}
+
+  SUBCASE("Data within window does not trigger error")
+  {
+    bool error_fired = false;
+    engine.on_connection_error([&](std::error_code) {
+      error_fired = true;
+    });
+
+    // Send 65535 bytes — exactly the default window.
+    auto df = make_data_frame(stream_id, 65535);
+    mock::recv(engine, df);
+
+    CHECK_FALSE(error_fired);
+
+    // Drain any WINDOW_UPDATE frames.
+    while (auto f = mock::capture_frame(engine)) {}
+  }
+
+  SUBCASE("Large transfer does not exhaust connection window")
+  {
+    // The connection recv window starts at 65535. As data arrives in chunks
+    // (limited by the 16384-byte input buffer), update_flow_control()
+    // replenishes the window via WINDOW_UPDATE whenever consumed bytes
+    // exceed half the initial window size. This verifies the window never
+    // goes negative during a sustained transfer larger than the window.
+    bool error_fired = false;
+    engine.on_connection_error([&](std::error_code) {
+      error_fired = true;
+    });
+
+    // Simulate a 200KB transfer — well beyond the 65535 window.
+    uint32_t total_received = 0;
+    const uint32_t chunk_size = 8192;
+    const uint32_t total_to_send = 200000;
+
+    while (total_received < total_to_send)
+    {
+      uint32_t this_chunk = std::min(chunk_size, total_to_send - total_received);
+      bool last = (total_received + this_chunk >= total_to_send);
+      auto df = make_data_frame(stream_id, this_chunk, last);
+      mock::recv(engine, df);
+      total_received += this_chunk;
+
+      // Drain WINDOW_UPDATE frames.
+      while (auto f = mock::capture_frame(engine)) {}
+    }
+
+    CHECK_FALSE(error_fired);
+    CHECK(total_received == total_to_send);
+  }
+
+  SUBCASE("Stream-level window violation triggers FLOW_CONTROL_ERROR")
+  {
+    http::v2::engine small_engine;
+    small_engine.set_initial_window_size(1000);
+    auto sid = small_engine.open_stream();
+
+    // Drain startup output.
+    mock::skip_preface(small_engine);
+    while (auto f = mock::capture_frame(small_engine)) {}
+
+    int error_count = 0;
+    std::error_code received_error;
+    small_engine.on_connection_error([&](std::error_code ec) {
+      error_count++;
+      received_error = ec;
+    });
+
+    // Send 1001 bytes — exceeds the stream's 1000-byte window but not the
+    // connection's 65535-byte window. The stream-level check should still
+    // fire FLOW_CONTROL_ERROR.
+    auto df = make_data_frame(sid, 1001);
+    mock::recv(small_engine, df);
+
+    CHECK(error_count >= 1);
+    CHECK(received_error == http::make_error_code(http::error_code::flow_control_error));
   }
 }

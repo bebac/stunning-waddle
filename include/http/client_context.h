@@ -12,6 +12,10 @@ namespace http
 
     void set_protocol_version(protocol_version v);
 
+    void set_initial_window_size(uint32_t size) {
+      engine_->set_initial_window_size(size);
+    }
+
     // Client opens streams
     auto open_stream() -> stream;
 

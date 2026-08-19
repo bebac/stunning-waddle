@@ -117,6 +117,9 @@ namespace http
     virtual int64_t connection_send_window() const = 0;
     virtual int64_t stream_send_window(uint32_t stream_id) const = 0;
 
+    // --- Flow control configuration ---
+    virtual void set_initial_window_size(uint32_t size) {}
+
   public:
     void on_headers(headers_callback cb)
     {

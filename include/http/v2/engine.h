@@ -23,6 +23,7 @@ namespace http::v2
   {
     uint32_t consumed_bytes = 0; // Bytes consumed (incoming flow control)
     int64_t send_window = 0;     // Send window (outgoing flow control)
+    int64_t recv_window = 0;     // Receive window (incoming flow control)
     bool known = false;          // Whether this stream is known/acknowledged
   };
 
@@ -38,6 +39,8 @@ namespace http::v2
     };
   public:
     explicit engine(connection_role role = connection_role::client);
+
+    void set_initial_window_size(uint32_t size) override;
 
     auto input_begin() -> std::span<std::byte> override;
     void input_end(size_t n) override;
@@ -151,6 +154,14 @@ namespace http::v2
     static constexpr uint32_t default_initial_window_size_ = 65535;
     uint32_t initial_window_size_ = default_initial_window_size_;
     uint32_t connection_consumed_ = 0;
+
+    // Receive-side flow control: our advertised window that bounds how much
+    // DATA the peer may send us. Tracked to detect FLOW_CONTROL_ERROR (RFC
+    // 7540 6.9) when the peer exceeds the window.
+    int64_t connection_recv_window_ = default_initial_window_size_;
+
+    // Local SETTINGS to advertise to the peer (e.g. SETTINGS_INITIAL_WINDOW_SIZE).
+    std::vector<setting> local_settings_;
 
     // Send-side flow control: the peer's advertised windows that bound how much
     // DATA we may send. The connection-level window is shared across all

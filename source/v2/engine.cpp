@@ -244,7 +244,9 @@ namespace http::v2
     }
     else
     {
-      if ((h.flags & std::byte(0x01)) != std::byte{0} && h.length == 0)
+      // END_STREAM (flag 0x01) is only meaningful for DATA and HEADERS frames.
+      if ((h.flags & std::byte(0x01)) != std::byte{0} && h.length == 0 &&
+          (h.type == frame_type::data || h.type == frame_type::headers))
       {
         if (closed_cb_) {
           closed_cb_(h.stream_id);
@@ -353,16 +355,39 @@ namespace http::v2
 
   void engine::write_settings()
   {
-    // Queue initial empty SETTINGS frame
-    encode_settings_frame(pending_out_, {}, false);
+    // Queue SETTINGS frame with any local settings (e.g. initial_window_size).
+    encode_settings_frame(pending_out_, local_settings_, false);
+
+    // RFC 7540 5.1.1: SETTINGS must be the first frame sent.
+    // If initial_window_size_ > default, send WINDOW_UPDATE on stream 0 for the delta.
+    if (initial_window_size_ > default_initial_window_size_)
+    {
+      uint32_t delta = initial_window_size_ - default_initial_window_size_;
+      encode_window_update_frame(pending_out_, 0, delta);
+    }
+
     maybe_invoke_output_ready();
   }
 
   void engine::update_flow_control(uint32_t stream_id, uint32_t bytes_received)
   {
+    // Decrement receive windows -- the peer is consuming our advertised credit.
+    connection_recv_window_ -= static_cast<int64_t>(bytes_received);
+    auto& flow_state = get_or_init_stream_flow_state(stream_id);
+    flow_state.recv_window -= static_cast<int64_t>(bytes_received);
+
+    // RFC 7540 6.9: receiving more data than the window allows is a
+    // FLOW_CONTROL_ERROR connection error.
+    if (connection_recv_window_ < 0 || flow_state.recv_window < 0)
+    {
+      if (conn_error_cb_) {
+        conn_error_cb_(http::make_error_code(http::error_code::flow_control_error));
+      }
+      return;
+    }
+
     // Accumulate consumed bytes for both connection and stream.
     connection_consumed_ += bytes_received;
-    auto& flow_state = get_or_init_stream_flow_state(stream_id);
     flow_state.consumed_bytes += bytes_received;
 
     // Send connection-level WINDOW_UPDATE when half the window is consumed.
@@ -370,6 +395,7 @@ namespace http::v2
 
     if (connection_consumed_ >= threshold) {
       encode_window_update_frame(pending_out_, 0, connection_consumed_);
+      connection_recv_window_ += connection_consumed_;
       connection_consumed_ = 0;
       maybe_invoke_output_ready();
     }
@@ -377,6 +403,7 @@ namespace http::v2
     // Send stream-level WINDOW_UPDATE.
     if (flow_state.consumed_bytes >= threshold) {
       encode_window_update_frame(pending_out_, stream_id, flow_state.consumed_bytes);
+      flow_state.recv_window += flow_state.consumed_bytes;
       flow_state.consumed_bytes = 0;
       maybe_invoke_output_ready();
     }
@@ -389,6 +416,7 @@ namespace http::v2
       it = stream_flow_states_.emplace(
         stream_id, stream_flow_state{}).first;
       it->second.send_window = static_cast<int64_t>(peer_initial_window_size_);
+      it->second.recv_window = static_cast<int64_t>(initial_window_size_);
     }
     return it->second;
   }
@@ -514,6 +542,23 @@ namespace http::v2
   void engine::send_goaway(uint32_t last_stream_id, http::error_code error_code, std::span<const std::byte> debug_data)
   {
     encode_goaway_frame(pending_out_, last_stream_id, error_code, debug_data);
+  }
+
+  void engine::set_initial_window_size(uint32_t size)
+  {
+    initial_window_size_ = size;
+    local_settings_.push_back({settings_id::initial_window_size, size});
+
+    // The connection-level flow control window starts at 65535 (RFC 7540
+    // 6.5.2). SETTINGS_INITIAL_WINDOW_SIZE only affects stream-level windows.
+    // To increase the connection-level window, we need to send a WINDOW_UPDATE
+    // on stream 0 for the delta. This is done in write_settings() to ensure
+    // SETTINGS frame is sent first (RFC 7540 5.1.1, 6.5).
+    if (size > default_initial_window_size_)
+    {
+      uint32_t delta = size - default_initial_window_size_;
+      connection_recv_window_ += static_cast<int64_t>(delta);
+    }
   }
 
   void engine::apply_peer_initial_window_size(uint32_t new_size)

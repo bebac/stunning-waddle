@@ -79,12 +79,18 @@ TEST_CASE("HTTP/2 Server Engine: receiving requests")
   mock::recv(engine, preface);
   engine.output_end(9); // Consume server's SETTINGS
 
-  SUBCASE("Server fires on_new_stream when receiving HEADERS on new stream")
+  SUBCASE("Server fires new_stream event when receiving HEADERS on new stream")
   {
     uint32_t received_stream_id = 0;
-    engine.on_new_stream([&](uint32_t id) {
-      received_stream_id = id;
-    });
+
+    // Drain events after feeding data
+    auto drain_and_check = [&]() {
+      while (auto ev = engine.next_event()) {
+        if (ev->is_new_stream()) {
+          received_stream_id = ev->stream_id;
+        }
+      }
+    };
 
     // Encode a minimal request HEADERS
     http::v2::hpack_context encoder;
@@ -112,16 +118,22 @@ TEST_CASE("HTTP/2 Server Engine: receiving requests")
 
     mock::recv(engine, frame);
 
+    drain_and_check();
     CHECK(received_stream_id == 1);
   }
 
   SUBCASE("Server receives and decodes request headers")
   {
     http::headers received_headers;
-    engine.on_headers([&](uint32_t id, const http::headers& h) {
-      (void)id;
-      received_headers = h;
-    });
+
+    // Drain events after feeding data
+    auto drain_and_check = [&]() {
+      while (auto ev = engine.next_event()) {
+        if (ev->is_headers()) {
+          received_headers = std::get<http::headers>(ev->payload);
+        }
+      }
+    };
 
     // Encode request headers
     http::v2::hpack_context encoder;
@@ -149,6 +161,8 @@ TEST_CASE("HTTP/2 Server Engine: receiving requests")
     frame.insert(frame.end(), header_block.begin(), header_block.end());
 
     mock::recv(engine, frame);
+
+    drain_and_check();
 
     CHECK(received_headers.get(":method") == "POST");
     CHECK(received_headers.get(":path") == "/api/data");

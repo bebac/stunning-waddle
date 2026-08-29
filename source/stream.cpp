@@ -73,45 +73,6 @@ namespace http
     send_data({}, true);
   }
 
-  void stream::on_headers(std::function<void(const headers&)> cb)
-  {
-    if (impl_) {
-      impl_->on_headers = std::move(cb);
-    }
-  }
-
-  void stream::on_data(std::function<void(std::span<const std::byte>)> cb)
-  {
-    if (impl_) {
-      impl_->on_data = std::move(cb);
-    }
-  }
-
-  void stream::on_end(std::function<void()> cb)
-  {
-    if (impl_) {
-      impl_->on_end = std::move(cb);
-    }
-  }
-
-  void stream::on_reset(std::function<void(std::error_code)> cb)
-  {
-    if (impl_) {
-      impl_->on_reset = std::move(cb);
-    }
-  }
-
-  void stream::on_window_available(std::function<void()> cb)
-  {
-    if (impl_) {
-      impl_->on_window_available = std::move(cb);
-      // Invoke immediately if both windows are already available.
-      if (stream_send_window() > 0 && connection_send_window() > 0) {
-        impl_->on_window_available();
-      }
-    }
-  }
-
   int64_t stream::stream_send_window() const
   {
     if (impl_ && impl_->stream_send_window_fn) {

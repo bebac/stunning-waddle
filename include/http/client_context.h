@@ -18,9 +18,6 @@ namespace http
 
     // Client opens streams
     auto open_stream() -> stream;
-
-  protected:
-    void dispatch_headers(uint32_t id, const headers& h) override;
   };
 }
 

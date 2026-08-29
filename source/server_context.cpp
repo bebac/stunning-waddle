@@ -19,21 +19,12 @@ namespace http
     case protocol_version::v3:
       throw std::runtime_error("HTTP/3 not supported yet");
     }
-    register_common_callbacks();
-    register_server_callbacks();
   }
 
-  void server_context::on_new_stream(std::function<void(stream, const headers&)> cb)
+  void server_context::on_new_stream_event(uint32_t id)
   {
-    on_new_stream_ = std::move(cb);
-  }
-
-  void server_context::register_server_callbacks()
-  {
-    // Server-specific: called when engine detects a new stream
-    engine_->on_new_stream([this](uint32_t id) {
-      dispatch_new_stream(id);
-    });
+    // Create the stream but don't notify yet - wait for headers
+    create_server_stream(id);
   }
 
   stream server_context::create_server_stream(uint32_t id)
@@ -61,35 +52,5 @@ namespace http
     };
 
     return create_stream_with_state(state);
-  }
-
-  void server_context::dispatch_new_stream(uint32_t id)
-  {
-    // Create the stream but don't notify yet - wait for headers
-    create_server_stream(id);
-  }
-
-  void server_context::dispatch_headers(uint32_t id, const headers& h)
-  {
-    if (auto it = streams_.find(id); it != streams_.end())
-    {
-      auto& state = it->second;
-
-      // First HEADERS on this stream - notify user with stream + request headers
-      if (state->state == stream_state_enum::idle)
-      {
-        state->state = stream_state_enum::open;
-        if (on_new_stream_) {
-          on_new_stream_(stream(state), h);
-        }
-      }
-      else
-      {
-        // Subsequent headers (e.g., trailers) - use the on_headers callback
-        if (auto& cb = state->on_headers) {
-          cb(h);
-        }
-      }
-    }
   }
 } // namespace http

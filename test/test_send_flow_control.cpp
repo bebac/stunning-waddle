@@ -6,8 +6,11 @@
 #include "http/v2/engine.h"
 #include "http/v2/frame.h"
 #include "http/client_context.h"
+#include "http/event.h"
 #include <vector>
 #include <cstring>
+#include <algorithm>
+#include <ranges>
 
 namespace
 {
@@ -18,6 +21,51 @@ namespace
     std::vector<std::byte> frame;
     http::v2::encode_data_frame(frame, stream_id, payload, end_stream);
     return frame;
+  }
+
+  // Feed data to a context. input_end() does not auto-drain events.
+  void feed_data(http::client_context& ctx, std::span<const std::byte> data)
+  {
+    while (!data.empty())
+    {
+      auto in_buffer = ctx.input_begin();
+      if (in_buffer.empty()) break;
+      size_t n = std::min(in_buffer.size(), data.size());
+      std::ranges::copy(data.first(n), in_buffer.begin());
+      ctx.input_end(n);
+      data = data.subspan(n);
+    }
+  }
+
+  // Drain all queued events and return them for inspection.
+  std::vector<http::event> drain_all_events(http::client_context& ctx)
+  {
+    std::vector<http::event> events;
+    while (ctx.has_events()) {
+      auto ev = ctx.next_event();
+      if (ev) events.push_back(std::move(*ev));
+    }
+    return events;
+  }
+
+  // Check if any event in the list is a stream_window_available for the given stream.
+  bool has_stream_window_event(const std::vector<http::event>& events, uint32_t stream_id)
+  {
+    for (const auto& ev : events) {
+      if (ev.is_stream_window_available() && ev.stream_id == stream_id)
+        return true;
+    }
+    return false;
+  }
+
+  // Check if any event in the list is a connection_window_available.
+  bool has_connection_window_event(const std::vector<http::event>& events)
+  {
+    for (const auto& ev : events) {
+      if (ev.is_connection_window_available())
+        return true;
+    }
+    return false;
   }
 }
 
@@ -160,16 +208,16 @@ TEST_CASE("Send flow control: send_data enforces window limits")
 }
 
 // =============================================================================
-// SECTION 2: Window availability callbacks
+// SECTION 2: Window availability events
 // =============================================================================
 //
-// These tests verify that callbacks are invoked when flow control windows
-// transition from exhausted (<=0) to available (>0).
+// These tests verify that window availability events are produced when flow
+// control windows transition from exhausted (<=0) to available (>0).
 //
 
-TEST_CASE("Send flow control: window availability callbacks")
+TEST_CASE("Send flow control: window availability events")
 {
-  SUBCASE("stream on_window_available callback invoked immediately if window > 0")
+  SUBCASE("stream window is available when both windows > 0")
   {
     http::client_context ctx;
     auto stream = ctx.open_stream();
@@ -179,16 +227,12 @@ TEST_CASE("Send flow control: window availability callbacks")
     mock::skip_preface(ctx);
     while (auto f = mock::capture_frame(ctx)) {}
 
-    bool callback_invoked = false;
-    stream.on_window_available([&]() {
-      callback_invoked = true;
-    });
-
     // Window should be available initially (65535 > 0)
-    CHECK(callback_invoked == true);
+    CHECK(stream.stream_send_window() > 0);
+    CHECK(stream.connection_send_window() > 0);
   }
 
-  SUBCASE("stream callback invoked after stream WINDOW_UPDATE when connection window > 0")
+  SUBCASE("stream_window_available event after stream WINDOW_UPDATE when connection window > 0")
   {
     http::client_context ctx;
     auto stream = ctx.open_stream();
@@ -201,31 +245,27 @@ TEST_CASE("Send flow control: window availability callbacks")
     // Exhaust both windows
     std::vector<std::byte> data(65535, std::byte{'x'});
     stream.send_data(data, false);
-    // Drain DATA frames
     while (auto f = mock::capture_frame(ctx)) {}
 
     // Replenish connection window only
     std::vector<std::byte> conn_wu;
     http::v2::encode_window_update_frame(conn_wu, 0, 65535);
-    mock::recv(ctx, conn_wu);
-
-    // Register callback - should NOT fire (stream window is 0)
-    bool callback_invoked = false;
-    stream.on_window_available([&]() {
-      callback_invoked = true;
-    });
-    CHECK(callback_invoked == false);
+    feed_data(ctx, conn_wu);
+    // No stream_window_available event yet (stream window is 0)
+    auto events1 = drain_all_events(ctx);
+    CHECK_FALSE(has_stream_window_event(events1, stream.id()));
 
     // Send stream-level WINDOW_UPDATE
     std::vector<std::byte> wu;
     http::v2::encode_window_update_frame(wu, stream.id(), 1000);
-    mock::recv(ctx, wu);
+    feed_data(ctx, wu);
 
-    // Now both windows are > 0, callback should fire
-    CHECK(callback_invoked == true);
+    // Now both windows are > 0, stream_window_available event should fire
+    auto events2 = drain_all_events(ctx);
+    CHECK(has_stream_window_event(events2, stream.id()));
   }
 
-  SUBCASE("stream callback invoked after connection WINDOW_UPDATE when stream window > 0")
+  SUBCASE("stream_window_available event after connection WINDOW_UPDATE when stream window > 0")
   {
     http::client_context ctx;
     auto stream = ctx.open_stream();
@@ -243,25 +283,22 @@ TEST_CASE("Send flow control: window availability callbacks")
     // Replenish stream window only
     std::vector<std::byte> stream_wu;
     http::v2::encode_window_update_frame(stream_wu, stream.id(), 65535);
-    mock::recv(ctx, stream_wu);
-
-    // Register callback - should NOT fire (connection window is 0)
-    bool callback_invoked = false;
-    stream.on_window_available([&]() {
-      callback_invoked = true;
-    });
-    CHECK(callback_invoked == false);
+    feed_data(ctx, stream_wu);
+    // No stream_window_available event yet (connection window is 0)
+    auto events1 = drain_all_events(ctx);
+    CHECK_FALSE(has_stream_window_event(events1, stream.id()));
 
     // Send connection-level WINDOW_UPDATE
     std::vector<std::byte> conn_wu;
     http::v2::encode_window_update_frame(conn_wu, 0, 1000);
-    mock::recv(ctx, conn_wu);
+    feed_data(ctx, conn_wu);
 
-    // Now both windows are > 0, callback should fire
-    CHECK(callback_invoked == true);
+    // Now both windows are > 0, stream_window_available event should fire
+    auto events2 = drain_all_events(ctx);
+    CHECK(has_stream_window_event(events2, stream.id()));
   }
 
-  SUBCASE("connection callback invoked after connection WINDOW_UPDATE")
+  SUBCASE("connection_window_available event after connection WINDOW_UPDATE")
   {
     http::client_context ctx;
     auto stream = ctx.open_stream();
@@ -278,20 +315,16 @@ TEST_CASE("Send flow control: window availability callbacks")
 
     CHECK(stream.connection_send_window() == 0);
 
-    bool callback_invoked = false;
-    ctx.on_connection_window_available([&]() {
-      callback_invoked = true;
-    });
-
     // Send connection-level WINDOW_UPDATE
     std::vector<std::byte> wu;
     http::v2::encode_window_update_frame(wu, 0, 1000);
-    mock::recv(ctx, wu);
+    feed_data(ctx, wu);
 
-    CHECK(callback_invoked == true);
+    auto events = drain_all_events(ctx);
+    CHECK(has_connection_window_event(events));
   }
 
-  SUBCASE("callback not invoked when window remains exhausted")
+  SUBCASE("no window event when window remains exhausted")
   {
     http::client_context ctx;
     auto stream = ctx.open_stream();
@@ -306,18 +339,12 @@ TEST_CASE("Send flow control: window availability callbacks")
     stream.send_data(data, false);
     while (auto f = mock::capture_frame(ctx)) {}
 
-    // Register callback - should NOT fire (window is exhausted)
-    int callback_count = 0;
-    stream.on_window_available([&]() {
-      callback_count++;
-    });
-    CHECK(callback_count == 0);
-
-    // No WINDOW_UPDATE sent - callback should not fire
-    CHECK(callback_count == 0);
+    // No WINDOW_UPDATE sent — drain events, should have no window events
+    auto events = drain_all_events(ctx);
+    CHECK(events.empty());
   }
 
-  SUBCASE("stream callback invoked after SETTINGS_INITIAL_WINDOW_SIZE increases window")
+  SUBCASE("stream_window_available event after SETTINGS_INITIAL_WINDOW_SIZE increases window")
   {
     http::client_context ctx;
     auto stream = ctx.open_stream();
@@ -335,14 +362,10 @@ TEST_CASE("Send flow control: window availability callbacks")
     // Replenish connection window only
     std::vector<std::byte> conn_wu;
     http::v2::encode_window_update_frame(conn_wu, 0, 65535);
-    mock::recv(ctx, conn_wu);
-
-    // Register callback - should NOT fire (stream window is 0)
-    bool callback_invoked = false;
-    stream.on_window_available([&]() {
-      callback_invoked = true;
-    });
-    CHECK(callback_invoked == false);
+    feed_data(ctx, conn_wu);
+    // No stream_window_available event yet (stream window is 0)
+    auto events1 = drain_all_events(ctx);
+    CHECK_FALSE(has_stream_window_event(events1, stream.id()));
 
     // Send SETTINGS with larger initial_window_size
     // Delta = 100000 - 65535 = 34465, stream window goes from 0 to 34465
@@ -351,10 +374,14 @@ TEST_CASE("Send flow control: window availability callbacks")
     };
     std::vector<std::byte> sf;
     http::v2::encode_settings_frame(sf, settings, false);
-    mock::recv(ctx, sf);
+    feed_data(ctx, sf);
 
-    // Callback should fire
-    CHECK(callback_invoked == true);
+    // Drain events — should have stream_window_available
+    auto events2 = drain_all_events(ctx);
+    CHECK(has_stream_window_event(events2, stream.id()));
+
+    // Also drain SETTINGS ACK output
+    while (auto f = mock::capture_frame(ctx)) {}
   }
 }
 
@@ -385,20 +412,8 @@ TEST_CASE("Send flow control: realistic send pattern with backpressure")
   // Drain DATA frames
   while (auto f = mock::capture_frame(ctx)) {}
 
-  // Set up callback to send remaining data
-  stream.on_window_available([&]() {
-    size_t remaining = body.size() - total_sent;
-    if (remaining == 0) return;
-
-    size_t sent = stream.send_data(
-      std::span<const std::byte>(body.data() + total_sent, remaining), true);
-    total_sent += sent;
-  });
-
-  // Callback should NOT fire immediately (window is exhausted)
-  CHECK(total_sent == 65535);
-
-  // Simulate receiving WINDOW_UPDATE frames to replenish windows
+  // Simulate receiving WINDOW_UPDATE frames to replenish windows.
+  // Drain events; when stream_window_available is seen, send more data.
   while (total_sent < body.size())
   {
     size_t before = total_sent;
@@ -406,13 +421,28 @@ TEST_CASE("Send flow control: realistic send pattern with backpressure")
     // Replenish both windows
     std::vector<std::byte> conn_wu;
     http::v2::encode_window_update_frame(conn_wu, 0, 65535);
-    mock::recv(ctx, conn_wu);
+    feed_data(ctx, conn_wu);
 
     std::vector<std::byte> stream_wu;
     http::v2::encode_window_update_frame(stream_wu, stream.id(), 65535);
-    mock::recv(ctx, stream_wu);
+    feed_data(ctx, stream_wu);
 
-    // Drain any output generated by callback
+    // Drain events and send data when window becomes available
+    while (ctx.has_events()) {
+      auto ev = ctx.next_event();
+      if (!ev) break;
+
+      if (ev->is_stream_window_available() && ev->stream_id == stream.id()) {
+        size_t remaining = body.size() - total_sent;
+        if (remaining == 0) break;
+
+        size_t sent = stream.send_data(
+          std::span<const std::byte>(body.data() + total_sent, remaining), true);
+        total_sent += sent;
+      }
+    }
+
+    // Drain any output generated by send_data
     while (auto f = mock::capture_frame(ctx)) {}
 
     if (total_sent == before) break; // No progress, avoid infinite loop

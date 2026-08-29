@@ -195,11 +195,15 @@ TEST_CASE("Engine flow control: WINDOW_UPDATE generation")
     // Send a DATA frame with END_STREAM.
     auto df = make_data_frame(stream_id, 100, /*end_stream=*/true);
 
-    bool stream_closed = false;
-    engine.on_stream_closed([&](uint32_t) { stream_closed = true; });
-
     mock::recv(engine, df);
 
+    // Verify stream_closed event was generated
+    bool stream_closed = false;
+    while (auto ev = engine.next_event()) {
+      if (ev->is_stream_closed() && ev->stream_id == stream_id) {
+        stream_closed = true;
+      }
+    }
     CHECK(stream_closed == true);
 
     // After stream close, a new stream should start with fresh tracking.
@@ -234,10 +238,17 @@ TEST_CASE("Engine flow control: large streaming response")
   std::vector<uint8_t> all_data;
   int window_updates_sent = 0;
 
-  engine.on_data([&](uint32_t sid, const uint8_t* data, size_t len) {
-    REQUIRE(sid == stream_id);
-    all_data.insert(all_data.end(), data, data + len);
-  });
+  // Drain events to collect all received data
+  auto drain_all_data = [&]() {
+    while (auto ev = engine.next_event()) {
+      if (ev->is_data() && ev->stream_id == stream_id) {
+        const auto& data = std::get<std::vector<std::byte>>(ev->payload);
+        all_data.insert(all_data.end(),
+          reinterpret_cast<const uint8_t*>(data.data()),
+          reinterpret_cast<const uint8_t*>(data.data()) + data.size());
+      }
+    }
+  };
 
   const uint32_t total_to_send = 200000;
   const uint32_t chunk_size = 8192;  // Typical HTTP/2 DATA frame size.
@@ -252,7 +263,8 @@ TEST_CASE("Engine flow control: large streaming response")
     mock::recv(engine, df);
     sent += this_chunk;
 
-    // Drain WINDOW_UPDATE frames (simulating the I/O pump flushing output).
+    // Drain events and WINDOW_UPDATE frames (simulating the I/O pump flushing output).
+    drain_all_data();
     while (auto f = mock::capture_frame(engine)) {
       if (f->type == 0x08) window_updates_sent++;
     }
@@ -380,33 +392,36 @@ TEST_CASE("END_STREAM flag only fires closed_cb_ for DATA and HEADERS")
   mock::skip_preface(engine);
   while (auto f = mock::capture_frame(engine)) {}
 
-  SUBCASE("Zero-length PING ACK does not fire closed_cb_")
+  SUBCASE("Zero-length PING ACK does not fire stream_closed event")
   {
-    bool stream_closed = false;
-    engine.on_stream_closed([&](uint32_t) { stream_closed = true; });
-
     // PING ACK: type=0x06, flags=0x01 (ACK), length=0, stream_id=0.
     // Flag 0x01 is ACK for PING, not END_STREAM. Before the fix this would
-    // spuriously fire closed_cb_ because any zero-length frame with flag
+    // spuriously fire stream_closed because any zero-length frame with flag
     // 0x01 was treated as END_STREAM.
     auto ping_ack = make_empty_frame(0x06, 0x01, 0);
     mock::recv(engine, ping_ack);
 
+    bool stream_closed = false;
+    while (auto ev = engine.next_event()) {
+      if (ev->is_stream_closed()) {
+        stream_closed = true;
+      }
+    }
     CHECK_FALSE(stream_closed);
   }
 
-  SUBCASE("Zero-length DATA with END_STREAM still fires closed_cb_")
+  SUBCASE("Zero-length DATA with END_STREAM still fires stream_closed event")
   {
-    bool stream_closed = false;
-    engine.on_stream_closed([&](uint32_t id) {
-      CHECK(id == stream_id);
-      stream_closed = true;
-    });
-
-    // DATA with END_STREAM and zero payload — should still fire closed_cb_.
+    // DATA with END_STREAM and zero payload — should still fire stream_closed.
     auto df = make_data_frame(stream_id, 0, /*end_stream=*/true);
     mock::recv(engine, df);
 
+    bool stream_closed = false;
+    while (auto ev = engine.next_event()) {
+      if (ev->is_stream_closed() && ev->stream_id == stream_id) {
+        stream_closed = true;
+      }
+    }
     CHECK(stream_closed);
   }
 }
@@ -472,15 +487,16 @@ TEST_CASE("Receive-side flow control enforcement")
 
   SUBCASE("Data within window does not trigger error")
   {
-    bool error_fired = false;
-    engine.on_connection_error([&](std::error_code) {
-      error_fired = true;
-    });
-
     // Send 65535 bytes — exactly the default window.
     auto df = make_data_frame(stream_id, 65535);
     mock::recv(engine, df);
 
+    bool error_fired = false;
+    while (auto ev = engine.next_event()) {
+      if (ev->is_connection_error()) {
+        error_fired = true;
+      }
+    }
     CHECK_FALSE(error_fired);
 
     // Drain any WINDOW_UPDATE frames.
@@ -495,9 +511,6 @@ TEST_CASE("Receive-side flow control enforcement")
     // exceed half the initial window size. This verifies the window never
     // goes negative during a sustained transfer larger than the window.
     bool error_fired = false;
-    engine.on_connection_error([&](std::error_code) {
-      error_fired = true;
-    });
 
     // Simulate a 200KB transfer — well beyond the 65535 window.
     uint32_t total_received = 0;
@@ -512,7 +525,12 @@ TEST_CASE("Receive-side flow control enforcement")
       mock::recv(engine, df);
       total_received += this_chunk;
 
-      // Drain WINDOW_UPDATE frames.
+      // Drain events and WINDOW_UPDATE frames.
+      while (auto ev = engine.next_event()) {
+        if (ev->is_connection_error()) {
+          error_fired = true;
+        }
+      }
       while (auto f = mock::capture_frame(engine)) {}
     }
 
@@ -530,18 +548,20 @@ TEST_CASE("Receive-side flow control enforcement")
     mock::skip_preface(small_engine);
     while (auto f = mock::capture_frame(small_engine)) {}
 
-    int error_count = 0;
-    std::error_code received_error;
-    small_engine.on_connection_error([&](std::error_code ec) {
-      error_count++;
-      received_error = ec;
-    });
-
     // Send 1001 bytes — exceeds the stream's 1000-byte window but not the
     // connection's 65535-byte window. The stream-level check should still
     // fire FLOW_CONTROL_ERROR.
     auto df = make_data_frame(sid, 1001);
     mock::recv(small_engine, df);
+
+    int error_count = 0;
+    std::error_code received_error;
+    while (auto ev = small_engine.next_event()) {
+      if (ev->is_connection_error()) {
+        error_count++;
+        received_error = std::get<std::error_code>(ev->payload);
+      }
+    }
 
     CHECK(error_count >= 1);
     CHECK(received_error == http::make_error_code(http::error_code::flow_control_error));

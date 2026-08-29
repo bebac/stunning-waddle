@@ -103,6 +103,9 @@ namespace http::v2
   {
     size_t to_erase = std::min(n, pending_out_.size());
     pending_out_.erase(pending_out_.begin(), pending_out_.begin() + to_erase);
+    if (pending_out_.empty()) {
+      had_output_ = false;
+    }
   }
 
   uint32_t engine::open_stream()
@@ -248,9 +251,7 @@ namespace http::v2
       if ((h.flags & std::byte(0x01)) != std::byte{0} && h.length == 0 &&
           (h.type == frame_type::data || h.type == frame_type::headers))
       {
-        if (closed_cb_) {
-          closed_cb_(h.stream_id);
-        }
+        event_queue_.emplace_back(event{h.stream_id, event_type::stream_closed});
       }
     }
   }
@@ -260,16 +261,12 @@ namespace http::v2
     switch (h.type)
     {
       case frame_type::data:
-        if (data_cb_) {
-          data_cb_(h.stream_id, reinterpret_cast<const uint8_t*>(chunk.data()), chunk.size());
-        }
+        event_queue_.emplace_back(event{h.stream_id, event_type::data, std::vector<std::byte>(chunk.begin(), chunk.end())});
         update_flow_control(h.stream_id, chunk.size());
         if ((h.flags & std::byte{0x01}) != std::byte{0})
         {
           stream_flow_states_.erase(h.stream_id);
-          if (closed_cb_) {
-            closed_cb_(h.stream_id);
-          }
+          event_queue_.emplace_back(event{h.stream_id, event_type::stream_closed});
         }
         break;
       case frame_type::headers: {
@@ -278,33 +275,28 @@ namespace http::v2
         if (role_ == connection_role::server && !flow_state.known)
         {
           flow_state.known = true;
-          if (new_stream_cb_) {
-            new_stream_cb_(h.stream_id);
-          }
+          event_queue_.emplace_back(event{h.stream_id, event_type::new_stream});
         }
         if ((h.flags & std::byte(0x04)) != std::byte{0}) // END_HEADERS
         {
           auto decoded = decode_ctx_.decode(reinterpret_cast<const uint8_t*>(chunk.data()), chunk.size());
-          if (headers_cb_) {
-            headers_cb_(h.stream_id, http::headers(decoded));
-          }
+          http::headers hdrs(std::move(decoded));
+          event_queue_.emplace_back(event{h.stream_id, event_type::headers, std::move(hdrs)});
         }
         if ((h.flags & std::byte(0x01)) != std::byte{0})
         {
-          if (closed_cb_) {
-            closed_cb_(h.stream_id);
-          }
+          event_queue_.emplace_back(event{h.stream_id, event_type::stream_closed});
         }
         break;
       }
       case frame_type::priority:
         //std::cerr << "[http] frame_type::priority unhandled" << std::endl;
         break;
-      case frame_type::rst_stream:
-        if (reset_cb_) {
-          reset_cb_(h.stream_id, std::make_error_code(std::errc::protocol_error));
-        }
+      case frame_type::rst_stream: {
+        auto reset_ec = std::make_error_code(std::errc::protocol_error);
+        event_queue_.emplace_back(event{h.stream_id, event_type::stream_reset, reset_ec});
         break;
+      }
       case frame_type::settings:
         if (chunk.size() >= h.length) {
           handle_settings_payload(chunk);
@@ -380,9 +372,8 @@ namespace http::v2
     // FLOW_CONTROL_ERROR connection error.
     if (connection_recv_window_ < 0 || flow_state.recv_window < 0)
     {
-      if (conn_error_cb_) {
-        conn_error_cb_(http::make_error_code(http::error_code::flow_control_error));
-      }
+      auto ec = http::make_error_code(http::error_code::flow_control_error);
+      event_queue_.emplace_back(event{0, event_type::connection_error, ec});
       return;
     }
 
@@ -446,9 +437,8 @@ namespace http::v2
 
     if (increment == 0) {
       // A zero increment is a PROTOCOL_ERROR per RFC 7540 6.9.
-      if (conn_error_cb_) {
-        conn_error_cb_(http::make_error_code(http::error_code::protocol_error));
-      }
+      auto ec = http::make_error_code(http::error_code::protocol_error);
+      event_queue_.emplace_back(event{0, event_type::connection_error, ec});
       return;
     }
 
@@ -506,9 +496,8 @@ namespace http::v2
     // Ensure MSB is 0 (31-bit value)
     if ((last_stream_id & 0x80000000) != 0) {
       // Invalid - treat as connection error
-      if (conn_error_cb_) {
-        conn_error_cb_(http::make_error_code(http::error_code::frame_size_error));
-      }
+      auto ec = http::make_error_code(http::error_code::frame_size_error);
+      event_queue_.emplace_back(event{0, event_type::connection_error, ec});
       return;
     }
 
@@ -533,10 +522,7 @@ namespace http::v2
     last_goaway_stream_id_ = last_stream_id;
     last_goaway_error_code_ = error_code;
 
-    // Invoke callback
-    if (goaway_cb_) {
-      goaway_cb_(last_stream_id, error_code);
-    }
+    event_queue_.emplace_back(event{0, event_type::goaway, goaway_info{last_stream_id, error_code}});
   }
 
   void engine::send_goaway(uint32_t last_stream_id, http::error_code error_code, std::span<const std::byte> debug_data)
@@ -585,9 +571,8 @@ namespace http::v2
     // Validate preface (caller already checked we have enough bytes)
     if (std::memcmp(input_buffer_.data(), preface.data(), preface.size()) != 0) {
       // Invalid preface - this is a connection error
-      if (conn_error_cb_) {
-        conn_error_cb_(http::make_error_code(http::error_code::protocol_error));
-      }
+      auto ec = http::make_error_code(http::error_code::protocol_error);
+      event_queue_.emplace_back(event{0, event_type::connection_error, ec});
       return false;
     }
     return true;

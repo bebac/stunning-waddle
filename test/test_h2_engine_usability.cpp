@@ -32,29 +32,11 @@ TEST_CASE("HTTP/2 Engine Usability")
     engine.output_end(out.size());
   }
 
-  SUBCASE("Engine supports granular callbacks")
+  SUBCASE("Engine supports event-based event consumption")
   {
     bool headers_received = false;
     bool data_received = false;
     bool stream_closed = false;
-
-    engine.on_headers([&](uint32_t stream_id, const http::headers& headers) {
-      (void)stream_id;
-      (void)headers;
-      headers_received = true;
-    });
-
-    engine.on_data([&](uint32_t stream_id, const uint8_t* data, size_t len) {
-      (void)stream_id;
-      (void)data;
-      (void)len;
-      data_received = true;
-    });
-
-    engine.on_stream_closed([&](uint32_t stream_id) {
-      (void)stream_id;
-      stream_closed = true;
-    });
 
     // Feed a HEADERS frame (Stream 1, END_HEADERS)
     auto hf = make_bytes(
@@ -66,6 +48,13 @@ TEST_CASE("HTTP/2 Engine Usability")
     );
 
     mock::recv(engine, hf);
+
+    // Drain events
+    while (auto ev = engine.next_event()) {
+      if (ev->is_headers()) {
+        headers_received = true;
+      }
+    }
 
     CHECK(headers_received == true);
 
@@ -79,6 +68,16 @@ TEST_CASE("HTTP/2 Engine Usability")
     );
 
     mock::recv(engine, df);
+
+    // Drain events
+    while (auto ev = engine.next_event()) {
+      if (ev->is_data()) {
+        data_received = true;
+      }
+      if (ev->is_stream_closed()) {
+        stream_closed = true;
+      }
+    }
 
     CHECK(data_received == true);
     CHECK(stream_closed == true);

@@ -4,29 +4,53 @@
 #include "http/client_context.h"
 #include "http/server_context.h"
 #include "http/v2/engine.h"
+#include "http/event.h"
 #include "http/error_codes.h"
 #include <vector>
 #include <cstring>
+#include <algorithm>
+#include <ranges>
 
 // Ensure we're using the vendored stunning-waddle headers
 static_assert(requires { typename http::context_base; }, "context_base should be available");
 static_assert(requires { typename http::client_context; }, "client_context should be available");
 static_assert(requires { typename http::server_context; }, "server_context should be available");
 
-TEST_CASE("Context Callbacks - on_goaway")
+namespace mock
 {
-  GIVEN("A client context with on_goaway callback registered")
+  // Feed data to a context without auto-draining events.
+  // Feed data to a context. input_end() does not auto-drain events,
+  // so events remain in the queue for next_event().
+  void feed_data(http::context_base& ctx, std::span<const std::byte> data)
+  {
+    while (!data.empty())
+    {
+      auto in_buffer = ctx.input_begin();
+      if (in_buffer.empty()) break;
+      size_t n = std::min(in_buffer.size(), data.size());
+      std::ranges::copy(data.first(n), in_buffer.begin());
+      ctx.input_end(n);
+      data = data.subspan(n);
+    }
+  }
+
+  // Drain all queued events and return them for inspection.
+  std::vector<http::event> drain_all_events(http::context_base& ctx)
+  {
+    std::vector<http::event> events;
+    while (ctx.has_events()) {
+      auto ev = ctx.next_event();
+      if (ev) events.push_back(std::move(*ev));
+    }
+    return events;
+  }
+}
+
+TEST_CASE("Context Events - goaway")
+{
+  GIVEN("A client context receiving a GOAWAY frame")
   {
     http::client_context client_ctx;
-    bool goaway_called = false;
-    uint32_t last_stream_id = 0;
-    std::error_code error_code;
-
-    client_ctx.on_goaway([&](uint32_t stream_id, std::error_code ec) {
-      goaway_called = true;
-      last_stream_id = stream_id;
-      error_code = ec;
-    });
 
     // Clear initial preface and settings from output
     auto out = client_ctx.output_begin();
@@ -34,8 +58,6 @@ TEST_CASE("Context Callbacks - on_goaway")
 
     WHEN("A GOAWAY frame is received")
     {
-      // Create a GOAWAY frame: length 8, type 7, flags 0, stream 0
-      // Payload: last_stream_id (4 bytes) + error_code (4 bytes)
       auto goaway_frame = make_bytes(
         0x00, 0x00, 0x08,      // Length 8
         0x07,                  // Type GOAWAY
@@ -45,45 +67,42 @@ TEST_CASE("Context Callbacks - on_goaway")
         0x00, 0x00, 0x00, 0x01  // Error code: PROTOCOL_ERROR (1)
       );
 
-      mock::recv(client_ctx, goaway_frame);
+      mock::feed_data(client_ctx, goaway_frame);
+      auto events = mock::drain_all_events(client_ctx);
 
-      THEN("The on_goaway callback should be triggered")
+      THEN("A goaway event should be in the queue")
       {
-        CHECK(goaway_called == true);
-        CHECK(last_stream_id == 1);
-        CHECK(error_code == http::make_error_code(http::error_code::protocol_error));
+        REQUIRE(events.size() == 1);
+        CHECK(events[0].is_goaway());
+
+        auto& info = std::get<http::goaway_info>(events[0].payload);
+        CHECK(info.last_stream_id == 1);
+        CHECK(info.ec == http::error_code::protocol_error);
       }
     }
   }
 
-  GIVEN("A server context with on_goaway callback registered")
+  GIVEN("A server context receiving a GOAWAY frame")
   {
     http::server_context server_ctx;
-    bool goaway_called = false;
-    uint32_t last_stream_id = 0;
-    std::error_code error_code;
-
-    server_ctx.on_goaway([&](uint32_t stream_id, std::error_code ec) {
-      goaway_called = true;
-      last_stream_id = stream_id;
-      error_code = ec;
-    });
 
     // Server needs to receive valid preface first to get past preface validation
     auto preface = make_bytes(
       'P', 'R', 'I', ' ', '*', ' ', 'H', 'T', 'T', 'P', '/', '2', '.', '0', '\r', '\n', '\r', '\n', 'S', 'M', '\r', '\n', '\r', '\n'
     );
-    mock::recv(server_ctx, preface);
-    
+    mock::feed_data(server_ctx, preface);
+
     // Clear any output (SETTINGS ACK, etc.)
     auto out = server_ctx.output_begin();
     if (out.size() > 0) {
       server_ctx.output_end(out.size());
     }
 
+    // Drain any events from preface processing
+    mock::drain_all_events(server_ctx);
+
     WHEN("A GOAWAY frame is received")
     {
-      // Create a GOAWAY frame
       auto goaway_frame = make_bytes(
         0x00, 0x00, 0x08,      // Length 8
         0x07,                  // Type GOAWAY
@@ -93,65 +112,58 @@ TEST_CASE("Context Callbacks - on_goaway")
         0x00, 0x00, 0x00, 0x00  // Error code: NO_ERROR (0)
       );
 
-      mock::recv(server_ctx, goaway_frame);
+      mock::feed_data(server_ctx, goaway_frame);
+      auto events = mock::drain_all_events(server_ctx);
 
-      THEN("The on_goaway callback should be triggered")
+      THEN("A goaway event should be in the queue")
       {
-        CHECK(goaway_called == true);
-        CHECK(last_stream_id == 3);
-        CHECK(error_code == http::make_error_code(http::error_code::no_error));
+        REQUIRE(events.size() == 1);
+        CHECK(events[0].is_goaway());
+
+        auto& info = std::get<http::goaway_info>(events[0].payload);
+        CHECK(info.last_stream_id == 3);
+        CHECK(info.ec == http::error_code::no_error);
       }
     }
   }
 }
 
-TEST_CASE("Context Callbacks - on_connection_error")
+TEST_CASE("Context Events - connection_error")
 {
-  GIVEN("A server context with on_connection_error callback registered")
+  GIVEN("A server context receiving an invalid client preface")
   {
     http::server_context server_ctx;
-    bool error_called = false;
-    std::error_code error_code;
 
-    server_ctx.on_connection_error([&](std::error_code ec) {
-      error_called = true;
-      error_code = ec;
-    });
-
-    WHEN("An invalid client preface is received")
+    WHEN("An invalid preface is received")
     {
-      // Send invalid preface (wrong bytes) - need 24 bytes to trigger validation
       auto invalid_preface = make_bytes(
         'I', 'N', 'V', 'A', 'L', 'I', 'D', ' ', 'P', 'R', 'E', 'F', 'A', 'C', 'E',
         ' ', 'T', 'E', 'S', 'T', ' ', 'D', 'A', 'T', 'A'
       );
 
-      mock::recv(server_ctx, invalid_preface);
+      mock::feed_data(server_ctx, invalid_preface);
+      auto events = mock::drain_all_events(server_ctx);
 
-      THEN("The on_connection_error callback should be triggered with protocol_error")
+      THEN("A connection_error event should be in the queue")
       {
-        CHECK(error_called == true);
-        CHECK(error_code == http::make_error_code(http::error_code::protocol_error));
+        REQUIRE(events.size() == 1);
+        CHECK(events[0].is_connection_error());
+
+        auto& ec = std::get<std::error_code>(events[0].payload);
+        CHECK(ec == http::make_error_code(http::error_code::protocol_error));
       }
     }
   }
 
-  GIVEN("A server context with on_connection_error callback for WINDOW_UPDATE error")
+  GIVEN("A server context receiving a WINDOW_UPDATE with zero increment")
   {
     http::server_context server_ctx;
-    bool error_called = false;
-    std::error_code error_code;
-
-    server_ctx.on_connection_error([&](std::error_code ec) {
-      error_called = true;
-      error_code = ec;
-    });
 
     // First, send valid preface to get past preface validation
     auto preface_bytes = make_bytes(
       'P', 'R', 'I', ' ', '*', ' ', 'H', 'T', 'T', 'P', '/', '2', '.', '0', '\r', '\n', '\r', '\n', 'S', 'M', '\r', '\n', '\r', '\n'
     );
-    mock::recv(server_ctx, preface_bytes);
+    mock::feed_data(server_ctx, preface_bytes);
 
     // Clear any output (SETTINGS ACK, etc.)
     auto out = server_ctx.output_begin();
@@ -159,9 +171,11 @@ TEST_CASE("Context Callbacks - on_connection_error")
       server_ctx.output_end(out.size());
     }
 
+    // Drain any events from preface processing
+    mock::drain_all_events(server_ctx);
+
     WHEN("A WINDOW_UPDATE frame with zero increment is received")
     {
-      // Create a WINDOW_UPDATE frame with zero increment (protocol error)
       auto window_update_frame = make_bytes(
         0x00, 0x00, 0x04,      // Length 4
         0x08,                  // Type WINDOW_UPDATE
@@ -170,32 +184,29 @@ TEST_CASE("Context Callbacks - on_connection_error")
         0x00, 0x00, 0x00, 0x00  // Zero increment - PROTOCOL_ERROR
       );
 
-      mock::recv(server_ctx, window_update_frame);
+      mock::feed_data(server_ctx, window_update_frame);
+      auto events = mock::drain_all_events(server_ctx);
 
-      THEN("The on_connection_error callback should be triggered with protocol_error")
+      THEN("A connection_error event should be in the queue")
       {
-        CHECK(error_called == true);
-        CHECK(error_code == http::make_error_code(http::error_code::protocol_error));
+        REQUIRE(events.size() == 1);
+        CHECK(events[0].is_connection_error());
+
+        auto& ec = std::get<std::error_code>(events[0].payload);
+        CHECK(ec == http::make_error_code(http::error_code::protocol_error));
       }
     }
   }
 
-  GIVEN("A server context with on_connection_error callback for invalid GOAWAY payload")
+  GIVEN("A server context receiving a GOAWAY with invalid last_stream_id")
   {
     http::server_context server_ctx;
-    bool error_called = false;
-    std::error_code error_code;
-
-    server_ctx.on_connection_error([&](std::error_code ec) {
-      error_called = true;
-      error_code = ec;
-    });
 
     // First, send valid preface to get past preface validation
     auto preface_bytes = make_bytes(
       'P', 'R', 'I', ' ', '*', ' ', 'H', 'T', 'T', 'P', '/', '2', '.', '0', '\r', '\n', '\r', '\n', 'S', 'M', '\r', '\n', '\r', '\n'
     );
-    mock::recv(server_ctx, preface_bytes);
+    mock::feed_data(server_ctx, preface_bytes);
 
     // Clear any output
     auto out = server_ctx.output_begin();
@@ -203,9 +214,11 @@ TEST_CASE("Context Callbacks - on_connection_error")
       server_ctx.output_end(out.size());
     }
 
+    // Drain any events from preface processing
+    mock::drain_all_events(server_ctx);
+
     WHEN("A GOAWAY frame with invalid last_stream_id (MSB set) is received")
     {
-      // Create a GOAWAY frame with invalid last_stream_id (MSB set to 1)
       auto goaway_frame = make_bytes(
         0x00, 0x00, 0x08,      // Length 8
         0x07,                  // Type GOAWAY
@@ -215,64 +228,63 @@ TEST_CASE("Context Callbacks - on_connection_error")
         0x00, 0x00, 0x00, 0x00  // Error code: NO_ERROR
       );
 
-      mock::recv(server_ctx, goaway_frame);
+      mock::feed_data(server_ctx, goaway_frame);
+      auto events = mock::drain_all_events(server_ctx);
 
-      THEN("The on_connection_error callback should be triggered with frame_size_error")
+      THEN("A connection_error event should be in the queue")
       {
-        CHECK(error_called == true);
-        CHECK(error_code == http::make_error_code(http::error_code::frame_size_error));
+        REQUIRE(events.size() == 1);
+        CHECK(events[0].is_connection_error());
+
+        auto& ec = std::get<std::error_code>(events[0].payload);
+        CHECK(ec == http::make_error_code(http::error_code::frame_size_error));
       }
     }
   }
 }
 
-TEST_CASE("Context Callbacks - Multiple callbacks")
+TEST_CASE("Context Events - multiple events")
 {
-  GIVEN("A server context with both on_goaway and on_connection_error callbacks")
+  GIVEN("A server context")
   {
     http::server_context server_ctx;
-    bool goaway_called = false;
-    bool error_called = false;
-
-    server_ctx.on_goaway([&](uint32_t, std::error_code) {
-      goaway_called = true;
-    });
-
-    server_ctx.on_connection_error([&](std::error_code) {
-      error_called = true;
-    });
 
     WHEN("An invalid preface is received")
     {
-      // Need 24 bytes to trigger preface validation
       auto invalid_preface = make_bytes(
         'I', 'N', 'V', 'A', 'L', 'I', 'D', ' ', 'P', 'R', 'E', 'F', 'A', 'C', 'E',
         ' ', 'T', 'E', 'S', 'T', ' ', 'D', 'A', 'T', 'A'
       );
-      mock::recv(server_ctx, invalid_preface);
 
-      THEN("Only the connection error callback should be triggered")
+      mock::feed_data(server_ctx, invalid_preface);
+      auto events = mock::drain_all_events(server_ctx);
+
+      THEN("Only a connection_error event should be present")
       {
-        CHECK(error_called == true);
-        CHECK(goaway_called == false);
+        REQUIRE(events.size() == 1);
+        CHECK(events[0].is_connection_error());
       }
     }
+  }
 
-    // Reset for next test
-    error_called = false;
-    goaway_called = false;
+  GIVEN("A server context with an established connection")
+  {
+    http::server_context server_ctx;
 
     // Send valid preface
     auto preface_bytes = make_bytes(
       'P', 'R', 'I', ' ', '*', ' ', 'H', 'T', 'T', 'P', '/', '2', '.', '0', '\r', '\n', '\r', '\n', 'S', 'M', '\r', '\n', '\r', '\n'
     );
-    mock::recv(server_ctx, preface_bytes);
+    mock::feed_data(server_ctx, preface_bytes);
 
     // Clear output
     auto out = server_ctx.output_begin();
     if (out.size() > 0) {
       server_ctx.output_end(out.size());
     }
+
+    // Drain any events from preface processing
+    mock::drain_all_events(server_ctx);
 
     WHEN("A valid GOAWAY frame is received")
     {
@@ -285,56 +297,16 @@ TEST_CASE("Context Callbacks - Multiple callbacks")
         0x00, 0x00, 0x00, 0x00  // Error code: NO_ERROR
       );
 
-      mock::recv(server_ctx, goaway_frame);
+      mock::feed_data(server_ctx, goaway_frame);
+      auto events = mock::drain_all_events(server_ctx);
 
-      THEN("Only the goaway callback should be triggered")
+      THEN("Only a goaway event should be present")
       {
-        CHECK(goaway_called == true);
-        CHECK(error_called == false);
-      }
-    }
-  }
-}
+        REQUIRE(events.size() == 1);
+        CHECK(events[0].is_goaway());
 
-TEST_CASE("Context Callbacks - Callback replacement")
-{
-  GIVEN("A server context where callbacks are replaced")
-  {
-    http::server_context server_ctx;
-    int goaway_call_count = 0;
-    int error_call_count = 0;
-
-    // First callback
-    server_ctx.on_goaway([&](uint32_t, std::error_code) {
-      goaway_call_count++;
-    });
-
-    server_ctx.on_connection_error([&](std::error_code) {
-      error_call_count++;
-    });
-
-    // Replace callbacks
-    server_ctx.on_goaway([&](uint32_t, std::error_code) {
-      goaway_call_count += 10; // Different behavior
-    });
-
-    server_ctx.on_connection_error([&](std::error_code) {
-      error_call_count += 10; // Different behavior
-    });
-
-    WHEN("Events are triggered")
-    {
-      // Trigger connection error - need 24 bytes to trigger preface validation
-      auto invalid_preface = make_bytes(
-        'I', 'N', 'V', 'A', 'L', 'I', 'D', ' ', 'P', 'R', 'E', 'F', 'A', 'C', 'E',
-        ' ', 'T', 'E', 'S', 'T', ' ', 'D', 'A', 'T', 'A'
-      );
-      mock::recv(server_ctx, invalid_preface);
-
-      THEN("The new callbacks should be called")
-      {
-        CHECK(error_call_count == 10);
-        CHECK(goaway_call_count == 0);
+        auto& info = std::get<http::goaway_info>(events[0].payload);
+        CHECK(info.last_stream_id == 5);
       }
     }
   }

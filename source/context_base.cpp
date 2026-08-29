@@ -3,95 +3,62 @@
 
 namespace http
 {
-  void context_base::on_goaway(std::function<void(uint32_t last_stream_id, std::error_code)> cb)
+  std::optional<event> context_base::next_event()
   {
-    on_goaway_ = std::move(cb);
-  }
-
-  void context_base::on_connection_error(std::function<void(std::error_code)> cb)
-  {
-    on_conn_error_ = std::move(cb);
-  }
-
-  void context_base::on_connection_window_available(std::function<void()> cb)
-  {
-    on_conn_window_available_ = std::move(cb);
-  }
-
-  void context_base::register_common_callbacks()
-  {
-    engine_->on_headers([this](uint32_t id, const headers& h) {
-      dispatch_headers(id, h);
-    });
-
-    engine_->on_data([this](uint32_t id, const uint8_t* d, size_t l) {
-      dispatch_data(id, std::span<const std::byte>(reinterpret_cast<const std::byte*>(d), l));
-    });
-
-    engine_->on_stream_closed([this](uint32_t id) {
-      dispatch_end(id);
-    });
-
-    engine_->on_stream_reset([this](uint32_t id, std::error_code ec) {
-      dispatch_reset(id, ec);
-    });
-
-    engine_->on_goaway([this](uint32_t last_stream_id, http::error_code error_code) {
-      if (on_goaway_) {
-        on_goaway_(last_stream_id, http::make_error_code(error_code));
-      }
-    });
-
-    engine_->on_connection_error([this](std::error_code ec) {
-      if (on_conn_error_) {
-        on_conn_error_(ec);
-      }
-    });
-
-    engine_->on_stream_window_available([this](uint32_t stream_id) {
-      if (auto it = streams_.find(stream_id); it != streams_.end()) {
-        if (auto& cb = it->second->on_window_available) {
-          cb();
-        }
-      }
-    });
-
-    engine_->on_connection_window_available([this]() {
-      if (on_conn_window_available_) {
-        on_conn_window_available_();
-      }
-    });
-  }
-
-  stream context_base::create_stream_with_state(std::shared_ptr<stream_state> state)
-  {
-    streams_[state->id] = state;
-    return stream(state);
-  }
-
-  void context_base::dispatch_data(uint32_t id, std::span<const std::byte> data)
-  {
-    if (auto it = streams_.find(id); it != streams_.end())
+    while (true)
     {
-      if (auto& cb = it->second->on_data) {
-        cb(data);
+      auto ev = engine_->next_event();
+      if (!ev) return std::nullopt;
+
+      switch (ev->type)
+      {
+      case event_type::new_stream:
+        // Internal: create stream state. The consumer never sees
+        // this event — loop to get the next one.
+        on_new_stream_event(ev->stream_id);
+        continue;
+
+      case event_type::stream_closed:
+        // Internal: update stream state (half-closed remote → closed).
+        // Erase from streams_ if fully closed.
+        close_stream_internal(ev->stream_id);
+        // Consumer still needs this event to close its channels.
+        return ev;
+
+      case event_type::stream_reset:
+        // Internal: erase from streams_ immediately.
+        reset_stream_internal(ev->stream_id);
+        // Consumer still needs this event to close its channels.
+        return ev;
+
+      default:
+        // All other events pass through unchanged.
+        return ev;
       }
     }
   }
 
-  void context_base::dispatch_end(uint32_t id)
+  stream context_base::get_stream(uint32_t id)
+  {
+    auto it = streams_.find(id);
+    if (it != streams_.end()) {
+      return stream(it->second);
+    }
+    return stream();
+  }
+
+  void context_base::close_stream_internal(uint32_t id)
   {
     if (auto it = streams_.find(id); it != streams_.end())
     {
       auto& state = it->second;
       if (state->state == stream_state_enum::half_closed_local)
         state->state = stream_state_enum::closed;
-      else
+      else if (state->state == stream_state_enum::open)
         state->state = stream_state_enum::half_closed_remote;
-
-      if (auto& cb = state->on_end) {
-        cb();
-      }
+      else
+        // idle or already half_closed_remote → fully closed
+        state->state = stream_state_enum::closed;
 
       // Clean up closed streams
       if (state->state == stream_state_enum::closed) {
@@ -100,14 +67,14 @@ namespace http
     }
   }
 
-  void context_base::dispatch_reset(uint32_t id, std::error_code ec)
+  void context_base::reset_stream_internal(uint32_t id)
   {
-    if (auto it = streams_.find(id); it != streams_.end())
-    {
-      if (auto& cb = it->second->on_reset) {
-        cb(ec);
-      }
-      streams_.erase(it);
-    }
+    streams_.erase(id);
+  }
+
+  stream context_base::create_stream_with_state(std::shared_ptr<stream_state> state)
+  {
+    streams_[state->id] = state;
+    return stream(state);
   }
 } // namespace http

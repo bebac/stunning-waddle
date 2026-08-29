@@ -1,6 +1,37 @@
 #include "doctest/doctest.h"
 #include "test_helpers.h"
 #include "http/client_context.h"
+#include "http/event.h"
+#include <algorithm>
+#include <ranges>
+
+namespace
+{
+  // Feed data to a context. input_end() does not auto-drain events.
+  void feed_data(http::client_context& ctx, std::span<const std::byte> data)
+  {
+    while (!data.empty())
+    {
+      auto in_buffer = ctx.input_begin();
+      if (in_buffer.empty()) break;
+      size_t n = std::min(in_buffer.size(), data.size());
+      std::ranges::copy(data.first(n), in_buffer.begin());
+      ctx.input_end(n);
+      data = data.subspan(n);
+    }
+  }
+
+  // Drain all queued events and return them for inspection.
+  std::vector<http::event> drain_all_events(http::client_context& ctx)
+  {
+    std::vector<http::event> events;
+    while (ctx.has_events()) {
+      auto ev = ctx.next_event();
+      if (ev) events.push_back(std::move(*ev));
+    }
+    return events;
+  }
+}
 
 TEST_CASE("client_context: dispatcher routes frames to correct stream")
 {
@@ -8,42 +39,30 @@ TEST_CASE("client_context: dispatcher routes frames to correct stream")
 
   ctx.set_protocol_version(http::protocol_version::v2);
 
-  // 1. Open a stream and capture its state
+  // 1. Open a stream
   auto stream = ctx.open_stream();
   uint32_t stream_id = stream.id();
 
-  bool headers_received = false;
-  std::string body_received;
-  bool stream_ended = false;
-
-  // 2. Attach manual callbacks
-  stream.on_headers([&](const http::headers& h) {
-    headers_received = true;
-    // Check for specific header if needed
-  });
-
-  stream.on_data([&](std::span<const std::byte> data) {
-    for (auto b : data)
-      body_received += static_cast<char>(b);
-  });
-
-  stream.on_end([&]() { stream_ended = true; });
-
-  // 3. Mock Server: Send HEADERS (Stream ID matches)
+  // 2. Mock Server: Send HEADERS (Stream ID matches)
   // Using Stream 1 (usually the first client stream)
   auto header_frame = make_bytes(
       0x00, 0x00, 0x01,       // Length
       0x01,                   // Type: HEADERS
-      0x05,                   // Flags: END_STREAM | END_HEADERS (Let's end it here for simplicity)
+      0x05,                   // Flags: END_STREAM | END_HEADERS
       0x00, 0x00, 0x00, 0x01, // Stream 1
       0x88                    // :status 200
   );
 
-  mock::recv(ctx, header_frame);
+  feed_data(ctx, header_frame);
+  auto events = drain_all_events(ctx);
 
-  // 4. Verify Dispatcher worked
-  CHECK(headers_received == true);
-  CHECK(stream_ended == true);
+  // 3. Verify events: headers + stream_closed
+  REQUIRE(events.size() == 2);
+  CHECK(events[0].is_headers());
+  CHECK(events[0].stream_id == stream_id);
+
+  CHECK(events[1].is_stream_closed());
+  CHECK(events[1].stream_id == stream_id);
 }
 
 TEST_CASE("client_context: multiplexing isolation")
@@ -55,12 +74,6 @@ TEST_CASE("client_context: multiplexing isolation")
   auto s1 = ctx.open_stream(); // Should be ID 1
   auto s2 = ctx.open_stream(); // Should be ID 3
 
-  int s1_count = 0;
-  int s2_count = 0;
-
-  s1.on_data([&](auto) { s1_count++; });
-  s2.on_data([&](auto) { s2_count++; });
-
   // Mock Data frame for Stream 3 (s2)
   auto data_s3 = make_bytes(
       0x00, 0x00, 0x01,       // Length 1
@@ -70,10 +83,13 @@ TEST_CASE("client_context: multiplexing isolation")
       0x41                    // 'A'
   );
 
-  mock::recv(ctx, data_s3);
+  feed_data(ctx, data_s3);
+  auto events = drain_all_events(ctx);
 
-  CHECK(s1_count == 0); // Stream 1 should be untouched
-  CHECK(s2_count == 1); // Stream 3 should have received data
+  // Should have exactly one data event for stream 3
+  REQUIRE(events.size() == 1);
+  CHECK(events[0].is_data());
+  CHECK(events[0].stream_id == 3);
 }
 
 TEST_CASE("client_context: stream transmission produces valid H2 frames")

@@ -148,6 +148,44 @@ while (ctx.has_output()) {
 
 Both approaches can be used together: use `on_output_ready()` to wake your event loop, then use `has_output()` in a loop to drain all pending output.
 
+### Consuming Protocol Events
+
+After calling `input_end(n)`, the engine may have produced protocol events (headers received, data received, stream closed, etc.). Events are queued internally and own their data. Drain them via `has_events()` / `next_event()`:
+
+```cpp
+ctx.input_end(n);
+
+while (ctx.has_events()) {
+  auto ev = ctx.next_event();
+  if (!ev) break;
+
+  switch (ev->type) {
+  case http::event_type::headers:
+    // ev->stream_id, std::get<http::headers>(ev->payload)
+    break;
+  case http::event_type::data:
+    // std::get<std::vector<std::byte>>(ev->payload)
+    break;
+  case http::event_type::stream_closed:
+    // stream is done — use ctx.get_stream(ev->stream_id) if needed
+    break;
+  case http::event_type::stream_reset:
+    // std::get<std::error_code>(ev->payload)
+    break;
+  case http::event_type::goaway:
+    // std::get<http::goaway_info>(ev->payload)
+    break;
+  case http::event_type::connection_error:
+    // std::get<std::error_code>(ev->payload)
+    break;
+  default:
+    break;
+  }
+}
+```
+
+The context handles stream lifecycle internally — `new_stream` events are consumed by the context and never returned to the caller. Use `get_stream(id)` to retrieve a stream handle when processing a `headers` event.
+
 ---
 
 ## Roadmap
@@ -162,7 +200,7 @@ The project is currently **Client-focused**, providing a high-level fluent API f
 * [x] **Send Flow Control:** Enforcement of peer's advertised send windows with partial sends, window availability callbacks (stream and connection level), and immediate invocation when windows are already open.
 * [ ] **Streaming Request Bodies:** Replace the eager-copy body model in `request_handle::execute()` with a producer or sink-style API so large request bodies can be streamed without buffering the entire payload in memory.
 * [ ] **Streaming Response Bodies:** Avoid buffering the full response body in `response_state::res.text`; provide an async iterator or callback-based interface so consumers can process response data incrementally as it arrives.
-* [ ] **SSE Event Streaming:** Coroutine adapter wrapping `sse_parser` so consumers can `co_await` individual `sse_event` values from a long-lived stream, with proper integration into the `on_data` / flow-control lifecycle.
+* [ ] **SSE Event Streaming:** Coroutine adapter wrapping `sse_parser` so consumers can `co_await` individual `sse_event` values from a long-lived stream, with proper integration into the event / flow-control lifecycle.
 * [ ] **HTTP/1.1:** Implementation of the text-based engine.
 * [ ] **HTTP/3:** QUIC integration and UDP transport logic.
 

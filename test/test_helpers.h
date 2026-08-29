@@ -110,6 +110,16 @@ namespace mock
       }
     }
   }
+  // Drain all queued events from an engine that supports has_events()
+  // and next_event(). Useful for tests that use the raw engine and want
+  // to verify event-based behavior without registering callbacks.
+  template<typename T>
+  void drain_events(T& target)
+  {
+    while (target.has_events()) {
+      target.next_event();
+    }
+  }
 } // namespace mock
 
 #endif // TEST_HELPERS_H

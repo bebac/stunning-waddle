@@ -2,6 +2,7 @@
 #define INCLUDE_HTTP_V2_ENGINE_H
 
 #include "http/protocol_engine.h"
+#include "http/event.h"
 #include "http/headers.h"
 #include "http/error_codes.h"
 #include "http/v2/frame.h"
@@ -11,10 +12,11 @@
 #include <array>
 #include <cstring>
 #include <functional>
-#include <map>
+#include <unordered_map>
 #include <span>
 #include <string>
 #include <vector>
+#include <deque>
 
 namespace http::v2
 {
@@ -67,7 +69,7 @@ namespace http::v2
 
     size_t send_data(uint32_t stream_id, std::span<const std::byte> data, bool end_stream) override;
 
-    void send_reset([[maybe_unused ]] uint32_t stream_id, [[maybe_unused ]] std::error_code ec) override
+    void send_reset([[maybe_unused ]] uint32_t stream_id, [[maybe_unused]] std::error_code ec) override
     {
     }
 
@@ -77,11 +79,25 @@ namespace http::v2
     bool has_output() const override { return !pending_out_.empty(); }
     void on_output_ready(output_ready_callback cb) override { output_ready_cb_ = std::move(cb); }
 
+    // Event interface
+    bool has_events() const override { return !event_queue_.empty(); }
+    auto next_event() -> std::optional<event> override
+    {
+      if (event_queue_.empty())
+        return std::nullopt;
+      auto ev = std::move(event_queue_.front());
+      event_queue_.pop_front();
+      return ev;
+    }
+
   private:
-    // Helper to invoke output_ready callback when pending_out_ transitions from empty to non-empty
+    // Helper to invoke output_ready callback when pending_out_ transitions
+    // from empty to non-empty (edge-triggered). Called at every site that
+    // writes to pending_out_.
     void maybe_invoke_output_ready()
     {
-      if (!pending_out_.empty() && output_ready_cb_) {
+      if (output_ready_cb_ && !had_output_) {
+        had_output_ = true;
         output_ready_cb_();
       }
     }
@@ -90,8 +106,8 @@ namespace http::v2
     // Only fires if the connection-level window is also > 0.
     void notify_stream_window_available(uint32_t stream_id)
     {
-      if (connection_send_window_ > 0 && stream_window_available_cb_) {
-        stream_window_available_cb_(stream_id);
+      if (connection_send_window_ > 0) {
+        event_queue_.emplace_back(event{stream_id, event_type::stream_window_available});
       }
     }
 
@@ -99,14 +115,10 @@ namespace http::v2
     // Also notifies all streams whose stream-level window is already > 0.
     void notify_connection_window_available()
     {
-      if (conn_window_available_cb_) {
-        conn_window_available_cb_();
-      }
-      if (stream_window_available_cb_) {
-        for (const auto& [id, state] : stream_flow_states_) {
-          if (state.send_window > 0) {
-            stream_window_available_cb_(id);
-          }
+      event_queue_.emplace_back(event{0, event_type::connection_window_available});
+      for (const auto& [id, state] : stream_flow_states_) {
+        if (state.send_window > 0) {
+          event_queue_.emplace_back(event{id, event_type::stream_window_available});
         }
       }
     }
@@ -145,6 +157,8 @@ namespace http::v2
     std::array<std::byte, 16384> input_buffer_;
     size_t input_buffered_ = 0;  // Number of unconsumed bytes at the start of input_buffer_
     std::vector<std::byte> pending_out_;
+    output_ready_callback output_ready_cb_;
+    bool had_output_ = false;
     frame_parser parser_;
     hpack_context encode_ctx_;
     hpack_context decode_ctx_;
@@ -171,11 +185,15 @@ namespace http::v2
     uint32_t peer_initial_window_size_ = default_initial_window_size_;
 
     // Unified stream tracking: combines known_streams_, stream_consumed_, and stream_send_window_
-    std::map<uint32_t, stream_flow_state> stream_flow_states_;
+    std::unordered_map<uint32_t, stream_flow_state> stream_flow_states_;
 
     bool goaway_received_ = false;
     uint32_t last_goaway_stream_id_ = 0;
     http::error_code last_goaway_error_code_ = http::error_code::no_error;
+
+    // Event queue: events queued during input_end(). The consumer drains
+    // them via has_events() / next_event().
+    std::deque<event> event_queue_;
   };
 } // namespace http::v2
 

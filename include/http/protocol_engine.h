@@ -3,10 +3,12 @@
 
 #include "http/headers.h"
 #include "http/error_codes.h"
+#include "http/event.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <system_error>
@@ -28,17 +30,6 @@ namespace http
 
   class protocol_engine
   {
-  public:
-    using data_callback = std::function<void(uint32_t, const uint8_t*, size_t)>;
-    using stream_closed_callback = std::function<void(uint32_t)>;
-    using stream_reset_callback = std::function<void(uint32_t, std::error_code)>;
-    using headers_callback = std::function<void(uint32_t, const headers&)>;
-    using new_stream_callback = std::function<void(uint32_t)>;
-    using goaway_callback = std::function<void(uint32_t last_stream_id, http::error_code error_code)>;
-    using connection_error_callback = std::function<void(std::error_code)>;
-    using connection_window_available_callback = std::function<void()>;
-    using stream_window_available_callback = std::function<void(uint32_t)>;
-
   public:
     virtual ~protocol_engine() = default;
 
@@ -62,30 +53,47 @@ namespace http
     virtual auto output_begin() -> std::span<const std::byte> = 0;
     virtual void output_end(size_t n) = 0;
 
-    // Output readiness notification
-    // 
+    // Output readiness: level-triggered polling.
+    //
     // has_output() returns true if there is pending data to send.
     // Use this for level-triggered driving: check before each I/O operation
     // or poll() call to determine if POLLOUT should be requested.
     //
-    // on_output_ready() registers a callback that is invoked when the engine
-    // transitions from having no output to having output (edge-triggered).
-    // Use this for edge-triggered driving (e.g., with epoll, io_uring, or
-    // to wake a sleeping event loop). The callback is invoked synchronously
-    // from the point where output is added, so it should not perform I/O
-    // directly but rather signal the event loop (e.g., via eventfd, self-pipe).
-    //
     // Level-triggered example:
     //   while (engine->has_output()) { poll with POLLOUT; write; }
     //
-    // Edge-triggered example:
-    //   engine->on_output_ready([&] { event_loop.wake(); });
-    //   // In event loop: when POLLOUT fires, write until WANT_WRITE
-    //
     virtual bool has_output() const = 0;
 
+    // Output readiness: edge-triggered notification.
+    //
+    // on_output_ready() registers a callback that is invoked when the
+    // engine transitions from having no output to having output. The
+    // callback fires only on the empty→non-empty transition, not on
+    // every write. It is reset when output_end() drains the buffer
+    // to empty.
+    //
+    // Use this for edge-triggered driving (e.g., with epoll, io_uring,
+    // or to wake a sleeping event loop). The callback is invoked
+    // synchronously from the point where output is added, so it should
+    // not perform I/O directly but rather signal the event loop.
+    //
+    // If no callback is registered, output readiness is polled via
+    // has_output().
     using output_ready_callback = std::function<void()>;
     virtual void on_output_ready(output_ready_callback cb) = 0;
+
+    //
+    // --- Events ---
+    //
+    // After calling input_end(n), the engine may have produced events
+    // (headers received, data received, stream closed, etc.). Events are
+    // queued internally and own their data. The consumer drains them via
+    // has_events() / next_event().
+    //
+    // Events are FIFO within a single input_end() call.
+    //
+    virtual bool has_events() const = 0;
+    virtual auto next_event() -> std::optional<event> = 0;
 
     //
     // --- Stream interface ---
@@ -110,74 +118,15 @@ namespace http
       bool end_stream
     ) = 0;
 
-    virtual size_t send_data(uint32_t stream_id, std::span<const std::byte> data, bool end_stream) = 0;
+    virtual auto send_data(uint32_t stream_id, std::span<const std::byte> data, bool end_stream) -> size_t = 0;
     virtual void send_reset(uint32_t stream_id, std::error_code ec) = 0;
 
     // --- Flow control window inspection ---
-    virtual int64_t connection_send_window() const = 0;
-    virtual int64_t stream_send_window(uint32_t stream_id) const = 0;
+    virtual auto connection_send_window() const -> int64_t = 0;
+    virtual auto stream_send_window(uint32_t stream_id) const -> int64_t = 0;
 
     // --- Flow control configuration ---
     virtual void set_initial_window_size(uint32_t size) {}
-
-  public:
-    void on_headers(headers_callback cb)
-    {
-      headers_cb_ = std::move(cb);
-    }
-
-    void on_data(data_callback cb)
-    {
-      data_cb_ = std::move(cb);
-    }
-
-    void on_stream_closed(stream_closed_callback cb)
-    {
-      closed_cb_ = std::move(cb);
-    }
-
-    void on_stream_reset(stream_reset_callback cb)
-    {
-      reset_cb_ = std::move(cb);
-    }
-
-    // Server mode: called when client opens a new stream
-    void on_new_stream(new_stream_callback cb)
-    {
-      new_stream_cb_ = std::move(cb);
-    }
-
-    void on_goaway(goaway_callback cb)
-    {
-      goaway_cb_ = std::move(cb);
-    }
-
-    void on_connection_error(connection_error_callback cb)
-    {
-      conn_error_cb_ = std::move(cb);
-    }
-
-    void on_connection_window_available(connection_window_available_callback cb)
-    {
-      conn_window_available_cb_ = std::move(cb);
-    }
-
-    void on_stream_window_available(stream_window_available_callback cb)
-    {
-      stream_window_available_cb_ = std::move(cb);
-    }
-
-  protected:
-    headers_callback headers_cb_;
-    data_callback data_cb_;
-    stream_closed_callback closed_cb_;
-    stream_reset_callback reset_cb_;
-    new_stream_callback new_stream_cb_;
-    goaway_callback goaway_cb_;
-    connection_error_callback conn_error_cb_;
-    output_ready_callback output_ready_cb_;
-    connection_window_available_callback conn_window_available_cb_;
-    stream_window_available_callback stream_window_available_cb_;
   };
 } // namespace http
 

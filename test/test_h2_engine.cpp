@@ -65,22 +65,24 @@ TEST_CASE("HTTP/2 Engine Sans-I/O")
 
   SUBCASE("Engine dispatches incoming DATA frames")
   {
-    bool data_received = false;
-    std::vector<uint8_t> received_payload;
-
-    engine.on_data([&](uint32_t stream_id, const uint8_t* data, size_t len) {
-      (void)stream_id;
-      data_received = true;
-      received_payload.assign(data, data + len);
-    });
-
     // Feed a DATA frame: Length 5, Type 0, Flags 0, Stream ID 1, Payload "hello"
     auto df = make_bytes(0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 'h', 'e', 'l', 'l', 'o');
 
     mock::recv(engine, df);
 
-    CHECK(data_received == true);
-    CHECK(received_payload == std::vector<uint8_t>{'h', 'e', 'l', 'l', 'o'});
+    // Drain events and verify data event
+    std::vector<http::event> events;
+    while (auto ev = engine.next_event()) {
+      events.push_back(std::move(*ev));
+    }
+
+    REQUIRE(events.size() == 1);
+    CHECK(events[0].is_data());
+    CHECK(events[0].stream_id == 1);
+
+    auto& data_payload = std::get<std::vector<std::byte>>(events[0].payload);
+    std::string received(reinterpret_cast<const char*>(data_payload.data()), data_payload.size());
+    CHECK(received == "hello");
   }
 }
 
@@ -190,115 +192,19 @@ TEST_CASE("HTTP/2 Engine Output Readiness")
     CHECK(engine.has_output() == true);
   }
 
-  SUBCASE("on_output_ready() callback fires when output transitions from empty to non-empty")
+  SUBCASE("has_output() works with context_base")
   {
-    http::v2::engine engine;
+    // Test that the passthrough methods in context_base work correctly
+    http::client_context ctx;
 
-    bool callback_fired = false;
-    engine.on_output_ready([&]() {
-      callback_fired = true;
-    });
+    // Engine starts empty
+    CHECK(ctx.has_output() == false);
 
-    // Consume all initial output
-    mock::skip_preface(engine);
-    auto out = engine.output_begin();
-    engine.output_end(out.size());
+    // Open a stream through the context - should generate output
+    auto stream_id = ctx.open_stream();
 
-    // Reset flag and verify no callback yet
-    callback_fired = false;
-    CHECK(callback_fired == false);
-
-    // Open a stream - should trigger callback
-    auto stream_id = engine.open_stream();
-
-    // Callback should have fired
-    CHECK(callback_fired == true);
-  }
-
-  SUBCASE("on_output_ready() callback fires when SETTINGS ACK is generated")
-  {
-    http::v2::engine engine;
-
-    bool callback_fired = false;
-    engine.on_output_ready([&]() {
-      callback_fired = true;
-    });
-
-    // Consume all initial output
-    mock::skip_preface(engine);
-    auto out = engine.output_begin();
-    engine.output_end(out.size());
-
-    // Reset flag
-    callback_fired = false;
-    CHECK(callback_fired == false);
-
-    // Feed SETTINGS frame - should trigger auto-ACK and callback
-    auto sf = make_bytes(
-        0x00, 0x00, 0x00,      // Length 0
-        0x04,                  // Type SETTINGS
-        0x00,                  // Flags (None)
-        0x00, 0x00, 0x00, 0x00 // Stream ID 0
-    );
-
-    mock::recv(engine, sf);
-
-    // Callback should have fired
-    CHECK(callback_fired == true);
-  }
-
-  SUBCASE("on_output_ready() callback fires when WINDOW_UPDATE is generated")
-  {
-    http::v2::engine engine;
-
-    bool callback_fired = false;
-    int callback_count = 0;
-    engine.on_output_ready([&]() {
-      callback_fired = true;
-      callback_count++;
-    });
-
-    // Consume all initial output
-    mock::skip_preface(engine);
-    auto out = engine.output_begin();
-    engine.output_end(out.size());
-
-    // Reset flag
-    callback_fired = false;
-    callback_count = 0;
-
-    // Open a stream
-    auto stream_id = engine.open_stream();
-
-    // Feed enough DATA to trigger flow control WINDOW_UPDATE
-    // Default window is 65535, threshold is half = 32767
-    // We need to send more than 32767 bytes of DATA
-    std::vector<std::byte> large_payload(35000);
-    std::fill(large_payload.begin(), large_payload.end(), std::byte('x'));
-
-    // Create a DATA frame with max payload
-    auto df = make_bytes(
-        0x00, 0x00, 0x05,      // Length 5 (just a small test)
-        0x00,                  // Type DATA
-        0x00,                  // Flags (None)
-        0x00, 0x00, 0x00, 0x01 // Stream ID 1
-    );
-    // Add payload
-    for (int i = 0; i < 5; i++) {
-      df.push_back(std::byte('x'));
-    }
-
-    mock::recv(engine, df);
-
-    // The WINDOW_UPDATE should be generated when flow control threshold is reached
-    // For this test, we just verify the callback mechanism works
-    // Note: The actual WINDOW_UPDATE generation depends on internal flow control tracking
-
-    // For now, just verify that sending data triggers output or callback
-    // (using separate checks to avoid doctest expression complexity issues)
-    if (!engine.has_output()) {
-      CHECK(callback_fired == true);
-    }
+    // Should have output
+    CHECK(ctx.has_output() == true);
   }
 
   SUBCASE("on_output_ready() fires when output transitions from empty to non-empty")
@@ -313,14 +219,13 @@ TEST_CASE("HTTP/2 Engine Output Readiness")
     // Engine starts empty - no callback yet
     CHECK(callback_count == 0);
 
-    // Open a stream - this generates preface and SETTINGS
-    // Note: open_stream() calls write_preface() and write_settings(), each calling maybe_invoke_output_ready()
-    // But since output was empty, the first call transitions to non-empty and fires the callback
-    // The second call sees output is already non-empty, so it doesn't fire again
+    // Open a stream - this generates preface and SETTINGS.
+    // write_preface() fires the callback (empty -> non-empty).
+    // write_settings() does NOT fire again (already non-empty).
     auto stream_id = engine.open_stream();
 
-    // Callback should have fired at least once
-    CHECK(callback_count >= 1);
+    // Callback should have fired exactly once
+    CHECK(callback_count == 1);
 
     // Consume all output
     auto out = engine.output_begin();
@@ -336,25 +241,60 @@ TEST_CASE("HTTP/2 Engine Output Readiness")
     CHECK(callback_count == 1);
   }
 
-  SUBCASE("has_output() and on_output_ready() work with context_base")
+  SUBCASE("on_output_ready() does not fire when output is already non-empty")
   {
-    // Test that the passthrough methods in context_base work correctly
-    http::client_context ctx;
+    http::v2::engine engine;
 
-    // Note: client_context wraps an engine, so we test the passthrough
-    // Engine starts empty
-    CHECK(ctx.has_output() == false);
+    int callback_count = 0;
+    engine.on_output_ready([&]() {
+      callback_count++;
+    });
+
+    // Open a stream - fires callback once
+    auto stream_id = engine.open_stream();
+    CHECK(callback_count == 1);
+
+    // Send request headers - should NOT fire again (output already non-empty)
+    engine.send_request_headers(stream_id, "GET", "/", "example.com", {}, false);
+    CHECK(callback_count == 1);
+  }
+
+  SUBCASE("on_output_ready() fires when SETTINGS ACK is generated")
+  {
+    http::v2::engine engine;
+
+    // Consume all initial output
+    mock::skip_preface(engine);
+    auto out = engine.output_begin();
+    engine.output_end(out.size());
 
     bool callback_fired = false;
-    ctx.on_output_ready([&]() {
+    engine.on_output_ready([&]() {
       callback_fired = true;
     });
 
-    // Open a stream through the context - should generate output
-    auto stream_id = ctx.open_stream();
+    CHECK(callback_fired == false);
 
-    // Should have output and callback should fire
-    CHECK(ctx.has_output() == true);
+    // Feed SETTINGS frame - should trigger auto-ACK
+    auto sf = make_bytes(
+        0x00, 0x00, 0x00,      // Length 0
+        0x04,                  // Type SETTINGS
+        0x00,                  // Flags (None)
+        0x00, 0x00, 0x00, 0x00 // Stream ID 0
+    );
+
+    mock::recv(engine, sf);
+
+    // Callback should have fired
     CHECK(callback_fired == true);
+  }
+
+  SUBCASE("on_output_ready() is a no-op when no callback is registered")
+  {
+    http::v2::engine engine;
+
+    // No callback registered - should not crash
+    auto stream_id = engine.open_stream();
+    CHECK(engine.has_output() == true);
   }
 }

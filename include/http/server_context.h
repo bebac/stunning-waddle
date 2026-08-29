@@ -12,19 +12,11 @@ namespace http
 
     void set_protocol_version(protocol_version v);
 
-    // New stream callback - fired when client opens a stream
-    void on_new_stream(std::function<void(stream, const headers&)> cb);
-
   protected:
-    void dispatch_headers(uint32_t id, const headers& h) override;
+    void on_new_stream_event(uint32_t id) override;
 
   private:
-    void register_server_callbacks();
-    stream create_server_stream(uint32_t id);
-    void dispatch_new_stream(uint32_t id);
-
-  private:
-    std::function<void(stream, const headers&)> on_new_stream_;
+    auto create_server_stream(uint32_t id) -> stream;
   };
 }
 

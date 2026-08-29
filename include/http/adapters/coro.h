@@ -3,13 +3,17 @@
 
 #include "http/stream.h"
 #include "http/headers.h"
+#include "http/context_base.h"
+#include "http/event.h"
 #include <charconv>
 #include <coroutine>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
 #include <system_error>
+#include <unordered_map>
 #include <utility>
 
 namespace http
@@ -119,6 +123,10 @@ namespace http
     // have been accepted by the engine so far.
     std::vector<std::byte> pending_body;
     size_t send_offset = 0;
+
+    // Called when a stream_window_available event is received for this
+    // stream, to attempt sending remaining body data.
+    std::function<void()> try_send_remaining;
   };
 
   struct response_awaiter {
@@ -142,10 +150,94 @@ namespace http
     }
   };
 
+  // Registry that maps stream IDs to response_state objects.
+  // The event loop calls pump() to drain events from the context
+  // and dispatch them to the appropriate response_state.
+  class request_registry
+  {
+  public:
+    void register_stream(uint32_t id, std::shared_ptr<response_state> state)
+    {
+      entries_[id] = std::move(state);
+    }
+
+    void pump(context_base& ctx)
+    {
+      while (ctx.has_events())
+      {
+        auto ev = ctx.next_event();
+        if (!ev) break;
+        dispatch(*ev);
+      }
+    }
+
+    bool empty() const { return entries_.empty(); }
+
+  private:
+    void dispatch(const event& ev)
+    {
+      auto it = entries_.find(ev.stream_id);
+      if (it == entries_.end()) return;
+      auto& state = it->second;
+
+      switch (ev.type)
+      {
+      case event_type::headers:
+      {
+        state->res.response_headers = std::get<headers>(ev.payload);
+        auto status = state->res.response_headers.get(":status");
+        if (!status.empty())
+        {
+          std::from_chars(status.data(),
+            status.data() + status.size(),
+            state->res.status_code);
+        }
+        break;
+      }
+
+      case event_type::data:
+      {
+        const auto& data_vec = std::get<std::vector<std::byte>>(ev.payload);
+        state->res.text.append(
+          reinterpret_cast<const char*>(data_vec.data()),
+          data_vec.size());
+        break;
+      }
+
+      case event_type::stream_closed:
+        state->completed = true;
+        if (state->continuation)
+          state->continuation.resume();
+        entries_.erase(it);
+        break;
+
+      case event_type::stream_reset:
+        state->ec = std::get<std::error_code>(ev.payload);
+        state->completed = true;
+        if (state->continuation)
+          state->continuation.resume();
+        entries_.erase(it);
+        break;
+
+      case event_type::stream_window_available:
+        if (state->try_send_remaining)
+          state->try_send_remaining();
+        break;
+
+      default:
+        break;
+      }
+    }
+
+  private:
+    std::unordered_map<uint32_t, std::shared_ptr<response_state>> entries_;
+  };
+
   class request_handle
   {
   public:
-    explicit request_handle(stream s) : stream_(std::move(s))
+    explicit request_handle(context_base& ctx, stream s, request_registry& registry)
+      : ctx_(ctx), stream_(std::move(s)), registry_(registry)
     {
     }
 
@@ -175,32 +267,8 @@ namespace http
       // Create shared state for this request
       auto state = std::make_shared<response_state>();
 
-      // Set up callbacks on the stream
-      stream_.on_headers([state](const headers& headers) {
-        state->res.response_headers = headers;
-        auto status = headers.get(":status");
-        if (!status.empty())
-        {
-          std::from_chars(status.data(), status.data() + status.size(), state->res.status_code);
-        }
-      });
-
-      stream_.on_data([state](std::span<const std::byte> data) {
-        state->res.text.append(reinterpret_cast<const char*>(data.data()), data.size());
-      });
-
-      stream_.on_end([state]() {
-        state->completed = true;
-        if (state->continuation)
-          state->continuation.resume();
-      });
-
-      stream_.on_reset([state](std::error_code error) {
-        state->ec = error;
-        state->completed = true;
-        if (state->continuation)
-          state->continuation.resume();
-      });
+      // Register with the registry so events are dispatched to this state
+      registry_.register_stream(stream_.id(), state);
 
       // Send request immediately (eager start)
       bool has_body = !body.empty();
@@ -212,7 +280,8 @@ namespace http
           reinterpret_cast<const std::byte*>(body.data()) + body.size());
 
         // Attempt initial send. If the window is exhausted before all data
-        // is sent, register on_window_available to send the remainder.
+        // is sent, the registry will call try_send_remaining when a
+        // stream_window_available event arrives.
         auto try_send_remaining = [this, state]() {
           if (state->send_offset >= state->pending_body.size()) return;
 
@@ -227,10 +296,9 @@ namespace http
 
         if (state->send_offset < state->pending_body.size())
         {
-          // Window exhausted — resume when flow control window becomes available.
-          stream_.on_window_available([state, try_send_remaining = std::move(try_send_remaining)]() {
-            try_send_remaining();
-          });
+          // Window exhausted — registry will call try_send_remaining when
+          // a stream_window_available event arrives for this stream.
+          state->try_send_remaining = std::move(try_send_remaining);
         }
       }
 
@@ -239,7 +307,9 @@ namespace http
     }
 
   private:
+    context_base& ctx_;
     stream stream_;
+    request_registry& registry_;
     std::string method_ = "GET";
     std::string path_ = "/";
     std::string host_;

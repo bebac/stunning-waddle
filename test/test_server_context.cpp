@@ -1,9 +1,12 @@
 #include "doctest/doctest.h"
 #include "test_helpers.h"
 #include "http/server_context.h"
+#include "http/event.h"
 #include "http/v2/hpack_context.h"
 #include <vector>
 #include <cstring>
+#include <algorithm>
+#include <ranges>
 
 namespace
 {
@@ -59,6 +62,32 @@ namespace
     mock::capture_frame(ctx);
     mock::capture_frame(ctx);
   }
+
+  // Feed data to a context. input_end() does not auto-drain events,
+  // so events remain in the queue for next_event().
+  void feed_data(http::server_context& ctx, std::span<const std::byte> data)
+  {
+    while (!data.empty())
+    {
+      auto in_buffer = ctx.input_begin();
+      if (in_buffer.empty()) break;
+      size_t n = std::min(in_buffer.size(), data.size());
+      std::ranges::copy(data.first(n), in_buffer.begin());
+      ctx.input_end(n);
+      data = data.subspan(n);
+    }
+  }
+
+  // Drain all queued events and return them for inspection.
+  std::vector<http::event> drain_all_events(http::server_context& ctx)
+  {
+    std::vector<http::event> events;
+    while (ctx.has_events()) {
+      auto ev = ctx.next_event();
+      if (ev) events.push_back(std::move(*ev));
+    }
+    return events;
+  }
 }
 
 TEST_CASE("server_context: accepts incoming streams")
@@ -67,18 +96,8 @@ TEST_CASE("server_context: accepts incoming streams")
 
   establish_connection(ctx);
 
-  SUBCASE("on_new_stream fires when client sends HEADERS")
+  SUBCASE("headers event fires when client sends HEADERS")
   {
-    bool stream_received = false;
-    http::headers received_headers;
-    uint32_t received_stream_id = 0;
-
-    ctx.on_new_stream([&](http::stream s, const http::headers& h) {
-      stream_received = true;
-      received_stream_id = s.id();
-      received_headers = h;
-    });
-
     auto headers_frame = make_headers_frame(1, {
       {":method", "GET"},
       {":scheme", "https"},
@@ -86,32 +105,44 @@ TEST_CASE("server_context: accepts incoming streams")
       {":path", "/test"}
     }, true);
 
-    mock::recv(ctx, headers_frame);
+    feed_data(ctx, headers_frame);
+    auto events = drain_all_events(ctx);
 
-    CHECK(stream_received == true);
-    CHECK(received_stream_id == 1);
-    CHECK(received_headers.get(":method") == "GET");
-    CHECK(received_headers.get(":path") == "/test");
+    // Should have headers + stream_closed events
+    REQUIRE(events.size() >= 1);
+    CHECK(events[0].is_headers());
+    CHECK(events[0].stream_id == 1);
+
+    auto& h = std::get<http::headers>(events[0].payload);
+    CHECK(h.get(":method") == "GET");
+    CHECK(h.get(":path") == "/test");
+
+    // Stream should have been created internally
+    CHECK(ctx.active_streams() == 0); // closed because END_STREAM
+
+    // get_stream should return empty (stream was closed)
+    auto s = ctx.get_stream(1);
+    CHECK_FALSE(s);
   }
 
   SUBCASE("active_streams returns correct count")
   {
-    ctx.on_new_stream([](http::stream, const http::headers&) {});
-
     CHECK(ctx.active_streams() == 0);
 
     // Send request on stream 1 (not end_stream)
     auto req1 = make_headers_frame(1, {
       {":method", "GET"}, {":scheme", "https"}, {":authority", "localhost"}, {":path", "/1"}
     }, false);
-    mock::recv(ctx, req1);
+    feed_data(ctx, req1);
+    drain_all_events(ctx);
     CHECK(ctx.active_streams() == 1);
 
     // Send request on stream 3
     auto req2 = make_headers_frame(3, {
       {":method", "GET"}, {":scheme", "https"}, {":authority", "localhost"}, {":path", "/2"}
     }, false);
-    mock::recv(ctx, req2);
+    feed_data(ctx, req2);
+    drain_all_events(ctx);
     CHECK(ctx.active_streams() == 2);
   }
 }
@@ -122,17 +153,30 @@ TEST_CASE("server_context: sends responses")
 
   establish_connection(ctx);
 
-  http::stream captured_stream;
-  ctx.on_new_stream([&](http::stream s, const http::headers&) {
-    captured_stream = std::move(s);
-  });
-
   // Client sends request
   auto req = make_headers_frame(1, {
     {":method", "GET"}, {":scheme", "https"}, {":authority", "localhost"}, {":path", "/"}
   }, true);
-  mock::recv(ctx, req);
+  feed_data(ctx, req);
+  auto events = drain_all_events(ctx);
 
+  // Should have headers + stream_closed
+  REQUIRE(events.size() >= 1);
+  CHECK(events[0].is_headers());
+
+  // Stream was closed (END_STREAM), so get_stream won't work.
+  // For response tests, we need a non-end_stream request.
+  // Redo with a non-end_stream request.
+  http::server_context ctx2;
+  establish_connection(ctx2);
+
+  auto req2 = make_headers_frame(1, {
+    {":method", "GET"}, {":scheme", "https"}, {":authority", "localhost"}, {":path", "/"}
+  }, false);
+  feed_data(ctx2, req2);
+  drain_all_events(ctx2);
+
+  auto captured_stream = ctx2.get_stream(1);
   REQUIRE(captured_stream);
 
   SUBCASE("send_response sends HEADERS with :status")
@@ -142,7 +186,7 @@ TEST_CASE("server_context: sends responses")
 
     captured_stream.send_response(200, response_headers, true);
 
-    auto frame = mock::capture_frame(ctx);
+    auto frame = mock::capture_frame(ctx2);
     REQUIRE(frame.has_value());
     CHECK(frame->type == 0x01); // HEADERS
     CHECK(frame->stream_id == 1);
@@ -175,12 +219,12 @@ TEST_CASE("server_context: sends responses")
       std::span<const std::byte>(reinterpret_cast<const std::byte*>(body.data()), body.size()),
       true);
 
-    auto headers_frame = mock::capture_frame(ctx);
+    auto headers_frame = mock::capture_frame(ctx2);
     REQUIRE(headers_frame.has_value());
     CHECK(headers_frame->type == 0x01);
     CHECK((headers_frame->flags & 0x01) == 0); // NOT END_STREAM
 
-    auto data_frame = mock::capture_frame(ctx);
+    auto data_frame = mock::capture_frame(ctx2);
     REQUIRE(data_frame.has_value());
     CHECK(data_frame->type == 0x00); // DATA
     CHECK(data_frame->stream_id == 1);
@@ -200,19 +244,7 @@ TEST_CASE("server_context: handles request body")
 
   establish_connection(ctx);
 
-  std::string received_body;
-  bool request_ended = false;
-
-  ctx.on_new_stream([&](http::stream s, const http::headers&) {
-    s.on_data([&](std::span<const std::byte> data) {
-      received_body.append(reinterpret_cast<const char*>(data.data()), data.size());
-    });
-    s.on_end([&]() {
-      request_ended = true;
-    });
-  });
-
-  // Client sends POST with body
+  // Client sends POST with body (not end_stream)
   auto req = make_headers_frame(1, {
     {":method", "POST"},
     {":scheme", "https"},
@@ -220,7 +252,7 @@ TEST_CASE("server_context: handles request body")
     {":path", "/upload"},
     {"content-length", "11"}
   }, false);
-  mock::recv(ctx, req);
+  feed_data(ctx, req);
 
   // Client sends DATA frame
   auto data_frame = make_bytes(
@@ -230,10 +262,23 @@ TEST_CASE("server_context: handles request body")
     0x00, 0x00, 0x00, 0x01, // Stream ID 1
     'H', 'e', 'l', 'l', 'o', ' ', 'W', 'o', 'r', 'l', 'd'
   );
-  mock::recv(ctx, data_frame);
+  feed_data(ctx, data_frame);
 
+  auto events = drain_all_events(ctx);
+
+  // Expect: headers, data, stream_closed
+  REQUIRE(events.size() == 3);
+  CHECK(events[0].is_headers());
+  CHECK(events[0].stream_id == 1);
+
+  CHECK(events[1].is_data());
+  CHECK(events[1].stream_id == 1);
+  auto& data = std::get<std::vector<std::byte>>(events[1].payload);
+  std::string received_body(reinterpret_cast<const char*>(data.data()), data.size());
   CHECK(received_body == "Hello World");
-  CHECK(request_ended == true);
+
+  CHECK(events[2].is_stream_closed());
+  CHECK(events[2].stream_id == 1);
 }
 
 TEST_CASE("server_context: multiplexing isolation")
@@ -242,28 +287,38 @@ TEST_CASE("server_context: multiplexing isolation")
 
   establish_connection(ctx);
 
-  std::map<uint32_t, std::string> stream_paths;
-
-  ctx.on_new_stream([&](http::stream s, const http::headers& h) {
-    stream_paths[s.id()] = h.get(":path");
-  });
-
   // Client opens multiple streams
   auto req1 = make_headers_frame(1, {
     {":method", "GET"}, {":scheme", "https"}, {":authority", "localhost"}, {":path", "/first"}
   }, true);
-
   auto req2 = make_headers_frame(3, {
     {":method", "GET"}, {":scheme", "https"}, {":authority", "localhost"}, {":path", "/second"}
   }, true);
-
   auto req3 = make_headers_frame(5, {
     {":method", "GET"}, {":scheme", "https"}, {":authority", "localhost"}, {":path", "/third"}
   }, true);
 
-  mock::recv(ctx, req1);
-  mock::recv(ctx, req2);
-  mock::recv(ctx, req3);
+  // Feed all at once
+  std::vector<std::byte> combined;
+  combined.insert(combined.end(), req1.begin(), req1.end());
+  combined.insert(combined.end(), req2.begin(), req2.end());
+  combined.insert(combined.end(), req3.begin(), req3.end());
+  feed_data(ctx, combined);
+
+  auto events = drain_all_events(ctx);
+
+  // Expect: headers(1), stream_closed(1), headers(3), stream_closed(3),
+  //         headers(5), stream_closed(5)
+  REQUIRE(events.size() == 6);
+
+  std::map<uint32_t, std::string> stream_paths;
+
+  for (auto& ev : events) {
+    if (ev.is_headers()) {
+      auto& h = std::get<http::headers>(ev.payload);
+      stream_paths[ev.stream_id] = h.get(":path");
+    }
+  }
 
   CHECK(stream_paths.size() == 3);
   CHECK(stream_paths[1] == "/first");

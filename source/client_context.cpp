@@ -19,7 +19,6 @@ namespace http
     case protocol_version::v3:
       throw std::runtime_error("HTTP/3 not supported yet");
     }
-    register_common_callbacks();
   }
 
   stream client_context::open_stream()
@@ -49,15 +48,5 @@ namespace http
     };
 
     return create_stream_with_state(state);
-  }
-
-  void client_context::dispatch_headers(uint32_t id, const headers& h)
-  {
-    if (auto it = streams_.find(id); it != streams_.end())
-    {
-      if (auto& cb = it->second->on_headers) {
-        cb(h);
-      }
-    }
   }
 } // namespace http

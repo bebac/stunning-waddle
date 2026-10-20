@@ -1,4 +1,5 @@
 #include "http/server_context.h"
+#include "http/v1/engine.h"
 
 namespace http
 {
@@ -12,7 +13,8 @@ namespace http
     switch (v)
     {
     case protocol_version::v1_1:
-      throw std::runtime_error("HTTP/1.1 not supported yet");
+      engine_ = std::make_unique<v1::engine>(connection_role::server);
+      break;
     case protocol_version::v2:
       engine_ = std::make_unique<v2::engine>(connection_role::server);
       break;

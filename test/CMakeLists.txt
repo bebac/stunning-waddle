@@ -27,6 +27,8 @@ add_executable(unit_tests
     test_send_flow_control.cpp
     test_event_queue.cpp
     test_direct_event_draining.cpp
+    test_h1_engine.cpp
+    test_h1_context.cpp
     test_main.cpp
 )
 

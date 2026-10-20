@@ -20,6 +20,7 @@ namespace http
     // Engine interface passthrough (Sans-I/O)
     auto input_begin() { return engine_->input_begin(); }
     void input_end(size_t n) { engine_->input_end(n); }
+    void eof() { engine_->eof(); }
     auto output_begin() { return engine_->output_begin(); }
     void output_end(size_t n) { engine_->output_end(n); }
 

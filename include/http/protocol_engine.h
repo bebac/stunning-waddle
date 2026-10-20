@@ -44,6 +44,16 @@ namespace http
     virtual void input_end(size_t n) = 0;
 
     //
+    // --- EOF ---
+    //
+    // Signals that the peer closed the connection (a read returned 0).
+    // The default implementation is a no-op; engines that distinguish
+    // EOF from a zero-length read (e.g. HTTP/1.1 close-delimited
+    // bodies) override it.
+    //
+    virtual void eof() {}
+
+    //
     // --- Output: engine -> network ---
     //
     // Interface to extract data from the protocol engine

@@ -144,8 +144,14 @@ std::error_condition make_error_condition(error_code ec);
 error_code error_code_from_http2(uint32_t wire);
 
 // Inverse of error_code_from_http2(): the RFC 7540 wire value for an enum
-// member. Used when encoding GOAWAY frames. Members that have no HTTP/2
-// wire equivalent (connection_reset, timeout) are returned unchanged.
+// member. Used when encoding GOAWAY and RST_STREAM frames.
+//
+// Members with no HTTP/2 wire equivalent (connection_reset, timeout, HTTP
+// status codes) map to INTERNAL_ERROR instead of leaking their enum value,
+// which would collide with a real wire code: connection_reset is 0x04, the
+// wire value of SETTINGS_TIMEOUT, and timeout is 0x05, the wire value of
+// STREAM_CLOSED. Unknown extension codes below the HTTP status range are
+// passed through so a code received from a peer survives a re-send.
 uint32_t http2_wire_code(error_code ec);
 
 } // namespace http

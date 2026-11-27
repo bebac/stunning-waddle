@@ -162,9 +162,23 @@ uint32_t http2_wire_code(error_code ec) {
     case error_code::enhance_your_calm: return 0x0b;
     case error_code::inadequate_security: return 0x0c;
     case error_code::http_1_1_required: return 0x0d;
+
+    // Generic transport errors have no HTTP/2 equivalent, and their enum
+    // values collide with real wire codes (0x04 is SETTINGS_TIMEOUT, 0x05 is
+    // STREAM_CLOSED), so they must not be passed through.
+    case error_code::connection_reset:
+    case error_code::timeout:
+      return 0x02;  // INTERNAL_ERROR
+
     default:
-      // No HTTP/2 wire equivalent (connection_reset, timeout, status codes).
-      return static_cast<uint32_t>(ec);
+      // Preserve unknown extension codes (for example one received from a
+      // peer through error_code_from_http2()) so they survive a re-send.
+      // Anything else -- HTTP status codes, HTTP/2-specific members without a
+      // wire value -- has no meaningful encoding.
+      if (is_transport_error(ec)) {
+        return static_cast<uint32_t>(ec);
+      }
+      return 0x02;  // INTERNAL_ERROR
   }
 }
 

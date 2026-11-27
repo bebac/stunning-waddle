@@ -82,6 +82,14 @@ namespace http::v2
     http::error_code error_code,
     std::span<const std::byte> debug_data = {}
   );
+
+  // PING frame (RFC 7540 6.7). The payload must be exactly 8 bytes; a
+  // PING ACK echoes the opaque data of the PING it answers.
+  void encode_ping_frame(
+    std::vector<std::byte>& dst,
+    std::span<const std::byte> payload,
+    bool ack
+  );
 } // namespace http::v2
 
 #endif // INCLUDE_HTTP_V2_FRAME_H

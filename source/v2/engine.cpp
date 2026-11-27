@@ -293,8 +293,35 @@ namespace http::v2
         //std::cerr << "[http] frame_type::priority unhandled" << std::endl;
         break;
       case frame_type::rst_stream: {
-        auto reset_ec = std::make_error_code(std::errc::protocol_error);
-        event_queue_.emplace_back(event{h.stream_id, event_type::stream_reset, reset_ec});
+        // RFC 7540 6.4: the payload is a 32-bit error code. Report the
+        // code the peer actually sent.
+        if (h.length != 4) {
+          // Malformed RST_STREAM: RFC 7540 6.4 makes this a
+          // FRAME_SIZE_ERROR connection error.
+          event_queue_.emplace_back(event{
+            0, event_type::connection_error,
+            http::make_error_code(http::error_code::frame_size_error)});
+          break;
+        }
+
+        // The payload can straddle reads; wait for all four bytes.
+        if (chunk.size() < h.length) {
+          return 0;
+        }
+
+        uint32_t wire_code =
+          (std::to_integer<uint32_t>(chunk[0]) << 24) |
+          (std::to_integer<uint32_t>(chunk[1]) << 16) |
+          (std::to_integer<uint32_t>(chunk[2]) <<  8) |
+           std::to_integer<uint32_t>(chunk[3]);
+
+        event ev{
+          h.stream_id,
+          event_type::stream_reset,
+          http::make_error_code(http::error_code_from_http2(wire_code))
+        };
+        ev.http2_error_code = wire_code;
+        event_queue_.push_back(std::move(ev));
         break;
       }
       case frame_type::settings:
@@ -309,7 +336,21 @@ namespace http::v2
         //std::cerr << "[http] frame_type::push_promise unhandled" << std::endl;
         break;
       case frame_type::ping:
-        //std::cerr << "[http] frame_type::ping unhandled" << std::endl;
+        // RFC 7540 6.7: a PING without the ACK flag MUST be answered with
+        // a PING ACK carrying the same 8 bytes of opaque data.
+        if (h.length != 8) {
+          // Malformed PING. RFC 7540 6.7 makes this a FRAME_SIZE_ERROR
+          // connection error, but ignoring it is the safer failure mode
+          // for a client: it cannot be confused with a real response.
+          break;
+        }
+        if (chunk.size() < h.length) {
+          return 0;  // payload straddles reads
+        }
+        if ((h.flags & std::byte{0x01}) == std::byte{0}) {
+          encode_ping_frame(pending_out_, chunk, true);
+          maybe_invoke_output_ready();
+        }
         break;
       case frame_type::goaway:
         if (chunk.size() >= h.length) {
@@ -508,8 +549,9 @@ namespace http::v2
       (std::to_integer<uint32_t>(payload[6]) << 8) |
       std::to_integer<uint32_t>(payload[7]);
 
-    // Convert to unified error_code
-    http::error_code error_code = static_cast<http::error_code>(wire_error_code);
+    // Convert to unified error_code. The enum renumbers the HTTP/2-specific
+    // codes, so this has to go through the mapping rather than a cast.
+    http::error_code mapped_code = http::error_code_from_http2(wire_error_code);
 
     // Extract debug data (if any)
     std::vector<std::byte> debug_data;
@@ -520,9 +562,11 @@ namespace http::v2
     // Update state
     goaway_received_ = true;
     last_goaway_stream_id_ = last_stream_id;
-    last_goaway_error_code_ = error_code;
+    last_goaway_error_code_ = mapped_code;
 
-    event_queue_.emplace_back(event{0, event_type::goaway, goaway_info{last_stream_id, error_code}});
+    event ev{0, event_type::goaway, goaway_info{last_stream_id, mapped_code}};
+    ev.http2_error_code = wire_error_code;
+    event_queue_.push_back(std::move(ev));
   }
 
   void engine::send_goaway(uint32_t last_stream_id, http::error_code error_code, std::span<const std::byte> debug_data)

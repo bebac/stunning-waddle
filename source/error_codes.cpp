@@ -124,4 +124,48 @@ std::error_condition make_error_condition(error_code ec) {
   return std::error_condition(static_cast<int>(ec), http_error_category::instance());
 }
 
+error_code error_code_from_http2(uint32_t wire) {
+  switch (wire) {
+    case 0x00: return error_code::no_error;
+    case 0x01: return error_code::protocol_error;
+    case 0x02: return error_code::internal_error;
+    case 0x03: return error_code::flow_control_error;
+    case 0x04: return error_code::settings_timeout;
+    case 0x05: return error_code::stream_closed;
+    case 0x06: return error_code::frame_size_error;
+    case 0x07: return error_code::refused_stream;
+    case 0x08: return error_code::cancel;
+    case 0x09: return error_code::compression_error;
+    case 0x0a: return error_code::connect_error;
+    case 0x0b: return error_code::enhance_your_calm;
+    case 0x0c: return error_code::inadequate_security;
+    case 0x0d: return error_code::http_1_1_required;
+    default:
+      // Unknown/extension wire code: keep the number so it is not lost.
+      return static_cast<error_code>(wire);
+  }
+}
+
+uint32_t http2_wire_code(error_code ec) {
+  switch (ec) {
+    case error_code::no_error: return 0x00;
+    case error_code::protocol_error: return 0x01;
+    case error_code::internal_error: return 0x02;
+    case error_code::flow_control_error: return 0x03;
+    case error_code::settings_timeout: return 0x04;
+    case error_code::stream_closed: return 0x05;
+    case error_code::frame_size_error: return 0x06;
+    case error_code::refused_stream: return 0x07;
+    case error_code::cancel: return 0x08;
+    case error_code::compression_error: return 0x09;
+    case error_code::connect_error: return 0x0a;
+    case error_code::enhance_your_calm: return 0x0b;
+    case error_code::inadequate_security: return 0x0c;
+    case error_code::http_1_1_required: return 0x0d;
+    default:
+      // No HTTP/2 wire equivalent (connection_reset, timeout, status codes).
+      return static_cast<uint32_t>(ec);
+  }
+}
+
 } // namespace http

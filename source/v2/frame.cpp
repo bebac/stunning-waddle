@@ -155,7 +155,7 @@ namespace http::v2
     dst.push_back(static_cast<std::byte>(stream_id_val & 0xFF));
 
     // Error Code (32-bit) - convert unified error_code to wire format
-    uint32_t wire_error_code = static_cast<uint32_t>(error_code);
+    uint32_t wire_error_code = http2_wire_code(error_code);
     dst.push_back(static_cast<std::byte>((wire_error_code >> 24) & 0xFF));
     dst.push_back(static_cast<std::byte>((wire_error_code >> 16) & 0xFF));
     dst.push_back(static_cast<std::byte>((wire_error_code >> 8) & 0xFF));
@@ -164,6 +164,28 @@ namespace http::v2
     // Debug data (optional)
     if (!debug_data.empty()) {
       dst.insert(dst.end(), debug_data.begin(), debug_data.end());
+    }
+  }
+
+  void encode_ping_frame(
+    std::vector<std::byte>& dst,
+    std::span<const std::byte> payload,
+    bool ack
+  )
+  {
+    frame_header hdr{
+      .length = static_cast<uint32_t>(payload.size()),
+      .type = frame_type::ping,
+      .flags = static_cast<std::byte>(ack ? 0x01 : 0x00),
+      .stream_id = 0,  // PING is a connection-level frame
+      .reserved = 0
+    };
+
+    write_frame_header(dst, hdr);
+
+    if (!payload.empty())
+    {
+      dst.insert(dst.end(), payload.begin(), payload.end());
     }
   }
 }

@@ -63,6 +63,16 @@ namespace http
       goaway_info
     > payload;
 
+    // Raw HTTP/2 error code as it appeared on the wire, for events that
+    // carry one (stream_reset, goaway). 0 otherwise.
+    //
+    // Kept alongside the mapped std::error_code because the unified enum
+    // renumbers the HTTP/2-specific codes, so the wire value would
+    // otherwise be lost — and that value is what tells a peer-side
+    // refusal (REFUSED_STREAM, CANCEL, ENHANCE_YOUR_CALM) apart from a
+    // genuine protocol violation.
+    uint32_t http2_error_code = 0;
+
     // --- Constructors ---
 
     event() = default;

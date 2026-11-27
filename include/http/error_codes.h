@@ -139,6 +139,15 @@ public:
 std::error_code make_error_code(error_code ec);
 std::error_condition make_error_condition(error_code ec);
 
+// Translate a raw HTTP/2 wire error code (RFC 7540 section 7) into the
+// unified error_code enum.
+error_code error_code_from_http2(uint32_t wire);
+
+// Inverse of error_code_from_http2(): the RFC 7540 wire value for an enum
+// member. Used when encoding GOAWAY frames. Members that have no HTTP/2
+// wire equivalent (connection_reset, timeout) are returned unchanged.
+uint32_t http2_wire_code(error_code ec);
+
 } // namespace http
 
 namespace std {
